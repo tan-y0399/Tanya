@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm --version)",
+      "Bash(npm --version)",
+      "Bash(npm install *)",
+      "Bash(scp -o StrictHostKeyChecking=no /tmp/router_fix.tar.gz root@192.168.163.15:/tmp/)",
+      "Bash(python -c \"from app.main import app; print\\('FastAPI app loaded OK'\\)\")",
+      "Bash(psql -h 127.0.0.1 -U postgres -d yunwei -c \"SELECT 1 AS connected;\")",
+      "Bash(sc query *)",
+      "Bash(where psql *)",
+      "Bash(where pg_ctl)",
+      "Bash(pg_ctl status *)",
+      "Bash(ls \"C:\\\\Program Files\\\\PostgreSQL\\\\18\\\\data\\\\\" 2>&1 | head -10)",
+      "Read(//c/Program Files/PostgreSQL/18/**)",
+      "Bash(pg_ctl start *)",
+      "Bash(net start *)",
+      "Bash(grep -v \"^$\")",
+      "Bash(sed -i 's/host    all             all             127.0.0.1\\\\/32            scram-sha-256/host    all             all             127.0.0.1\\\\/32            trust/' \"/c/Program Files/PostgreSQL/18/data/pg_hba.conf\" 2>&1)"
+    ],
+    "additionalDirectories": [
+      "C:\\Program Files\\PostgreSQL\\18\\data"
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir \"c:\\\\Users\\\\33255\\\\Desktop\\\\ruanjian\\\\frontend\\\\\" 2>/dev/null)",
+      "Bash(dir \"c:\\\\Users\\\\33255\\\\Desktop\\\\ruanjian\\\\frontend\" /b 2>nul)",
+      "Bash(ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no 192.168.163.15)",
+      "Bash(ssh 192.168.163.15 \"hostname && whoami && uname -a\")"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\33255\\Desktop\\ruanjian"
+    ]
+  }
+}

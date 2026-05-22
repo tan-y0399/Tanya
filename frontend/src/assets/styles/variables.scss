@@ -1,0 +1,75 @@
+// ==============================
+// KylinOps - 现代 SaaS 科技风主题
+// ==============================
+
+// 主色调 - 专业蓝
+$color-primary: #2563eb;
+$color-primary-light: #3b82f6;
+$color-primary-dark: #1d4ed8;
+$color-primary-bg: #eff6ff;
+
+// 强调色 - 靛蓝紫
+$color-accent: #6366f1;
+$color-accent-light: #818cf8;
+$color-accent-dark: #4f46e5;
+
+// 状态色
+$color-success: #10b981;
+$color-warning: #f59e0b;
+$color-danger: #ef4444;
+$color-info: #06b6d4;
+
+// 背景色系 - 浅色
+$bg-deep: #eef1f5;
+$bg-primary: #f5f6f8;
+$bg-secondary: #fafbfc;
+$bg-card: #ffffff;
+$bg-elevated: #ffffff;
+$bg-glass: rgba(255, 255, 255, 0.9);
+$bg-mask: rgba(15, 23, 42, 0.3);
+
+// 文字色系
+$text-primary: #1e293b;
+$text-secondary: #64748b;
+$text-muted: #94a3b8;
+$text-bright: #0f172a;
+
+// 边框色
+$border-default: #e2e8f0;
+$border-active: rgba(37, 99, 235, 0.4);
+$border-glow: rgba(37, 99, 235, 0.25);
+$border-light: #f1f5f9;
+
+// 阴影
+$shadow-card: 0 1px 3px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.03);
+$shadow-card-hover: 0 4px 16px rgba(0, 0, 0, 0.06), 0 2px 4px rgba(0, 0, 0, 0.04);
+$shadow-glow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+$shadow-glow-strong: 0 0 0 4px rgba(37, 99, 235, 0.15);
+$shadow-dropdown: 0 10px 40px rgba(0, 0, 0, 0.08);
+
+// 圆角
+$radius-sm: 6px;
+$radius-md: 10px;
+$radius-lg: 16px;
+$radius-full: 9999px;
+
+// 间距
+$spacing-xs: 4px;
+$spacing-sm: 8px;
+$spacing-md: 16px;
+$spacing-lg: 24px;
+$spacing-xl: 32px;
+$spacing-2xl: 48px;
+
+// 字体
+$font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+$font-sans: 'Inter', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+
+// 动画
+$transition-fast: 0.15s ease;
+$transition-normal: 0.3s ease;
+$transition-slow: 0.5s ease;
+
+// 布局
+$sidebar-width: 260px;
+$topbar-height: 56px;
