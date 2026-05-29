@@ -2,15 +2,42 @@
   <div class="dash">
     <div class="dash-top">
       <h2>运维仪表盘</h2>
-      <div class="srv-pick">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="8" height="8" rx="2"/><rect x="14" y="2" width="8" height="8" rx="2"/><rect x="2" y="14" width="8" height="8" rx="2"/><rect x="14" y="14" width="8" height="8" rx="2"/></svg>
-        <select v-model="server" @change="refresh">
-          <option v-for="s in servers" :key="s.id" :value="s.id">{{ s.name }}</option>
-        </select>
-        <span class="srv-dot" :class="srvOn ? 'on' : 'off'"></span>
+      <div class="dash-top-right">
+        <span class="last-update" v-if="lastUpdate && !loading">更新于 {{ lastUpdate }}</span>
+        <button class="refresh-btn" @click="refresh" :disabled="loading">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" :class="{ spinning: loading }"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
+          刷新
+        </button>
+        <div class="srv-pick">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="8" height="8" rx="2"/><rect x="14" y="2" width="8" height="8" rx="2"/><rect x="2" y="14" width="8" height="8" rx="2"/><rect x="14" y="14" width="8" height="8" rx="2"/></svg>
+          <select v-model="server" @change="refresh">
+            <option v-for="s in servers" :key="s.id" :value="s.id">{{ s.name }}</option>
+          </select>
+          <span class="srv-dot" :class="srvOn ? 'on' : 'off'"></span>
+        </div>
       </div>
     </div>
 
+    <!-- 首次加载状态 -->
+    <div v-if="loading && isFirstLoad" class="loading-state">
+      <div class="loading-spinner"></div>
+      <span>正在获取服务器数据...</span>
+    </div>
+
+    <!-- SSH 完全离线提示（仅在没有任何数据时显示） -->
+    <div v-else-if="isOffline && !hasPartialData" class="offline-banner">
+      <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+        <path d="M9 6v4M9 12.5v.5" stroke="#b45309" stroke-width="1.5" stroke-linecap="round"/>
+        <circle cx="9" cy="9" r="7.5" stroke="#b45309" stroke-width="1.5"/>
+      </svg>
+      <div>
+        <strong>无法连接到麒麟服务器 (192.168.163.15)</strong>
+        <p>请确认服务器 SSH 服务是否正常运行，或点击「刷新」重试</p>
+      </div>
+    </div>
+
+    <!-- 数据内容区（有数据就显示，即使是部分数据） -->
+    <template v-if="!isFirstLoad || !loading">
     <!-- 快速指标卡片（不需要 ECharts，直接显示） -->
     <div class="quick-metrics">
       <div class="qm-card">
@@ -38,15 +65,15 @@
     <!-- ECharts 折线图 -->
     <div class="charts" v-if="hasHistory">
       <div class="chart-card">
-        <div class="ch-head"><span class="ch-dot cpu"></span>CPU 历史趋势</div>
+        <div class="ch-head"><span class="ch-dot cpu"></span>CPU 历史趋势<span class="live-badge">LIVE</span></div>
         <v-chart :option="cpuOption" autoresize style="height:200px" />
       </div>
       <div class="chart-card">
-        <div class="ch-head"><span class="ch-dot mem"></span>内存历史趋势</div>
+        <div class="ch-head"><span class="ch-dot mem"></span>内存历史趋势<span class="live-badge">LIVE</span></div>
         <v-chart :option="memOption" autoresize style="height:200px" />
       </div>
       <div class="chart-card">
-        <div class="ch-head"><span class="ch-dot disk"></span>磁盘历史趋势</div>
+        <div class="ch-head"><span class="ch-dot disk"></span>磁盘历史趋势<span class="live-badge">LIVE</span></div>
         <v-chart :option="diskOption" autoresize style="height:200px" />
       </div>
     </div>
@@ -83,6 +110,7 @@
         </div>
       </div>
     </div>
+    </template>
   </div>
 </template>
 
@@ -99,6 +127,8 @@ import { getServers, type ServerInfo } from '@/api/servers'
 use([LineChart, GridComponent, TooltipComponent, CanvasRenderer])
 
 const loading = ref(true)
+const isFirstLoad = ref(true)
+const lastUpdate = ref('')
 const stats = ref<Record<string, any>>({})
 const mdata = ref<Record<string, any>>({})
 const alerts = ref<any[]>([])
@@ -109,22 +139,36 @@ let timer: any = null
 
 const srvOn = computed(() => servers.value.find(x => x.id === server.value)?.status === 'online')
 const upCount = computed(() => svcList.value.filter((s: any) => s.status === 'running').length)
-const hasHistory = computed(() => (mdata.value.cpu?.history?.length || 0) > 2)
+const hasHistory = computed(() => (mdata.value.cpu?.history?.length || 0) > 0)
+const hasPartialData = computed(() => {
+  return (mdata.value.cpu?.current !== undefined) ||
+         (mdata.value.memory?.current !== undefined) ||
+         (mdata.value.disk?.current !== undefined)
+})
+const isOffline = computed(() => {
+  if (loading.value) return false
+  return !hasPartialData.value
+})
 
 async function refresh() {
+  loading.value = true
   try {
-    // eslint-disable-next-line no-debugger
     const res = await api.get('/dashboard/overview', { params: { server_id: server.value || undefined } })
-    const payload: any = res.data  // {code:0, data:{stats,metrics,...}}
+    const payload: any = res.data
     if (payload && payload.data) {
       stats.value = payload.data.stats || {}
       mdata.value = payload.data.metrics || {}
       alerts.value = payload.data.anomalies || []
       svcList.value = payload.data.services || []
+      const now = new Date()
+      lastUpdate.value = now.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
     }
   } catch (e) {
-    // 静默处理
-  } finally { loading.value = false }
+    // 请求失败时保留上次数据，不清空
+  } finally {
+    loading.value = false
+    isFirstLoad.value = false
+  }
 }
 
 const cards = computed(() => {
@@ -146,24 +190,37 @@ const cards = computed(() => {
 })
 
 function makeOption(history: any[], color: string) {
+  const labels = history.map((d: any) => d.time)
+  const values = history.map((d: any) => d.value)
+  // 每 6 个点显示一个标签，避免过于拥挤
+  const labelStep = Math.max(1, Math.floor(history.length / 10))
+
   return {
     animation: true,
-    animationDuration: 500,
+    animationDuration: 300,
+    animationDurationUpdate: 600,
+    animationEasing: 'linear' as const,
+    animationEasingUpdate: 'cubicInOut' as const,
     grid: { top: 8, right: 16, bottom: 24, left: 40 },
     xAxis: {
       type: 'category',
-      data: history.map((d: any) => d.time).filter((_: any, i: number) => i % 4 === 0),
-      axisLabel: { fontSize: 10, color: '#94a3b8' },
+      data: labels,
+      axisLabel: {
+        fontSize: 10, color: '#94a3b8',
+        interval: labelStep - 1,
+        showMaxLabel: true,
+        showMinLabel: true,
+      },
       axisLine: { lineStyle: { color: '#e2e8f0' } },
       axisTick: { show: false },
     },
     yAxis: {
-      type: 'value', max: 100,
+      type: 'value', max: 100, min: 0,
       axisLabel: { fontSize: 10, color: '#94a3b8' },
       splitLine: { lineStyle: { color: '#f1f5f9', type: 'dashed' } },
     },
     series: [{
-      data: history.map((d: any) => d.value),
+      data: values,
       type: 'line', smooth: true, symbol: 'none',
       lineStyle: { color, width: 2.5 },
       areaStyle: {
@@ -173,7 +230,16 @@ function makeOption(history: any[], color: string) {
         },
       },
     }],
-    tooltip: { trigger: 'axis', borderColor: '#e2e8f0', backgroundColor: '#fff', textStyle: { color: '#334155', fontSize: 12 } },
+    tooltip: {
+      trigger: 'axis',
+      borderColor: '#e2e8f0',
+      backgroundColor: '#fff',
+      textStyle: { color: '#334155', fontSize: 12 },
+      formatter: (params: any) => {
+        const p = Array.isArray(params) ? params[0] : params
+        return `${p.axisValue}<br/><span style="color:${color};font-weight:600">${p.value}%</span>`
+      },
+    },
   }
 }
 
@@ -191,7 +257,7 @@ onMounted(async () => {
     }
   } catch { /* ignore */ }
   await refresh()
-  timer = setInterval(refresh, 30000)
+  timer = setInterval(refresh, 10000)
 })
 
 onUnmounted(() => { clearInterval(timer) })
@@ -202,6 +268,21 @@ onUnmounted(() => { clearInterval(timer) })
 .dash-top {
   display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px;
   h2 { margin: 0; font-size: 22px; font-weight: 700; color: #0f172a; }
+}
+.dash-top-right {
+  display: flex; align-items: center; gap: 10px;
+}
+.last-update {
+  font-size: 11px; color: #94a3b8;
+}
+.refresh-btn {
+  display: flex; align-items: center; gap: 5px;
+  padding: 6px 12px; border: 1px solid #e2e8f0; border-radius: 8px;
+  background: #fff; cursor: pointer; font-family: inherit; font-size: 12px;
+  color: #475569; transition: all .15s;
+  &:hover:not(:disabled) { background: #f1f5f9; border-color: #cbd5e1; }
+  &:disabled { opacity: 0.6; cursor: not-allowed; }
+  .spinning { animation: spin 0.8s linear infinite; }
 }
 .srv-pick {
   display: flex; align-items: center; gap: 8px;
@@ -225,6 +306,17 @@ onUnmounted(() => { clearInterval(timer) })
 .ch-head { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; color: #475569; margin-bottom: 4px; }
 .ch-dot { width: 8px; height: 8px; border-radius: 50%;
   &.cpu { background: #2563eb; } &.mem { background: #10b981; } &.disk { background: #f59e0b; }
+}
+.live-badge {
+  margin-left: auto;
+  font-size: 10px; font-weight: 700; color: #ef4444;
+  padding: 2px 6px; border-radius: 4px;
+  background: #fef2f2; border: 1px solid #fecaca;
+  animation: live-pulse 2s ease-in-out infinite;
+}
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
 }
 
 .bottom { display: grid; grid-template-columns: 2fr 2fr 1fr; gap: 14px; }
@@ -267,4 +359,40 @@ onUnmounted(() => { clearInterval(timer) })
 }
 
 .empty { text-align: center; color: #94a3b8; font-size: 13px; padding: 20px 0; }
+
+.offline-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px 20px;
+  margin-bottom: 16px;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 10px;
+  strong { font-size: 14px; color: #92400e; }
+  p { font-size: 12px; color: #a16207; margin: 4px 0 0; }
+}
+
+.loading-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 60px;
+  color: #94a3b8;
+  font-size: 14px;
+  gap: 16px;
+}
+.loading-spinner {
+  width: 36px;
+  height: 36px;
+  border: 3px solid #e2e8f0;
+  border-top-color: #2563eb;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
 </style>

@@ -24,4 +24,4 @@ class Approval(Base):
     comment = Column(String(500), nullable=True)
     requested_at = Column(DateTime, default=datetime.utcnow)
     resolved_at = Column(DateTime, nullable=True, default=None)
-    expires_at = Column(DateTime, default=lambda: datetime.utcnow() + timedelta(seconds=60))
+    expires_at = Column(DateTime, default=lambda: datetime.utcnow() + timedelta(seconds=120))

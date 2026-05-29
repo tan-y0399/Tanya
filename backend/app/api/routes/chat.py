@@ -68,16 +68,27 @@ async def send_message(req: dict = Body(...),
     pending_execution_id = req.get("pendingExecutionId", "")
 
     async def event_stream():
-        if pending_approval_id or pending_execution_id:
-            async for event in chat_service.resume_after_approval(
-                db, session_id, user["id"],
-                approval_id=pending_approval_id or None,
-                pending_execution_id=pending_execution_id or None,
-            ):
-                yield f"event: {event['event']}\ndata: {event['data']}\n\n"
-        else:
-            async for event in chat_service.process_message(db, session_id, content, user["id"]):
-                yield f"event: {event['event']}\ndata: {event['data']}\n\n"
+        try:
+            if pending_approval_id or pending_execution_id:
+                async for event in chat_service.resume_after_approval(
+                    db, session_id, user["id"],
+                    approval_id=pending_approval_id or None,
+                    pending_execution_id=pending_execution_id or None,
+                ):
+                    yield f"event: {event['event']}\ndata: {event['data']}\n\n"
+            else:
+                async for event in chat_service.process_message(db, session_id, content, user["id"]):
+                    yield f"event: {event['event']}\ndata: {event['data']}\n\n"
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).exception("SSE stream fatal error")
+            err_data = json.dumps({
+                "messageId": "err-{}".format(__import__('uuid').uuid4().hex[:8]),
+                "traceId": "",
+                "status": "error",
+                "error": str(e)[:200],
+            })
+            yield "event: message_done\ndata: {}\n\n".format(err_data)
 
     return StreamingResponse(
         event_stream(),

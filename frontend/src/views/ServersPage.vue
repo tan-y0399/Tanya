@@ -151,11 +151,16 @@ const emptyForm = () => ({
 
 const form = ref(emptyForm())
 
-async function loadServers() {
+async function loadServers(retryCount = 0) {
   try {
     const data = await getServers()
     servers.value = data.items || []
-  } catch {}
+  } catch (e) {
+    console.error('服务器列表加载失败:', e)
+    if (retryCount < 2) {
+      setTimeout(() => loadServers(retryCount + 1), 1000 * (retryCount + 1))
+    }
+  }
 }
 
 function statusLabel(status: string) {

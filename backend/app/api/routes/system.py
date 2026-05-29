@@ -1,7 +1,13 @@
-from fastapi import APIRouter, Body
+import os
+from fastapi import APIRouter, Depends, Body, HTTPException
 from app.core.config import settings
+from app.core.security import get_current_user
 
 router = APIRouter(prefix="/system", tags=["系统"])
+
+# 定位 .env 文件：优先从环境变量读取，否则在 backend 目录下找
+_ENV_PATH = os.environ.get("KILINOPS_ENV_PATH", os.path.join(os.path.dirname(__file__), "..", "..", "..", ".env"))
+_ENV_PATH = os.path.abspath(_ENV_PATH)
 
 
 @router.get("/health")
@@ -51,7 +57,7 @@ async def health():
 
 
 @router.get("/config")
-async def get_config():
+async def get_config(user: dict = Depends(get_current_user)):
     return {
         "code": 0,
         "data": {
@@ -77,7 +83,9 @@ async def get_config():
 
 
 @router.put("/config")
-async def update_config(payload: dict = Body(...)):
+async def update_config(payload: dict = Body(...), user: dict = Depends(get_current_user)):
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可修改安全配置")
     changed = []
     env_updates = {}
 
@@ -110,12 +118,11 @@ async def update_config(payload: dict = Body(...)):
 
     # 写回 .env 文件
     if env_updates:
-        env_path = "/opt/kylinops/backend/.env"
         try:
-            with open(env_path, "r") as f:
+            with open(_ENV_PATH, "r") as f:
                 lines = f.readlines()
             updated_keys = set()
-            with open(env_path, "w") as f:
+            with open(_ENV_PATH, "w") as f:
                 for line in lines:
                     stripped = line.strip()
                     if stripped and not stripped.startswith("#"):
@@ -133,3 +140,59 @@ async def update_config(payload: dict = Body(...)):
             pass  # 写入失败不影响已生效的内存配置
 
     return {"code": 0, "message": "配置已更新", "data": {"changed": changed}}
+
+
+@router.delete("/config")
+async def delete_config(user: dict = Depends(get_current_user)):
+    """重置/删除安全配置 — user 角色可操作"""
+    defaults = {
+        "LLM_TEMPERATURE": "0.1",
+        "LLM_MAX_TOKENS": "4096",
+        "APPROVAL_TIMEOUT": "300",
+        "MAX_CONVERSATION_ROUNDS": "20",
+    }
+    for key, val in defaults.items():
+        attr = {
+            "LLM_TEMPERATURE": "llm_temperature",
+            "LLM_MAX_TOKENS": "llm_max_tokens",
+            "APPROVAL_TIMEOUT": "approval_timeout",
+            "MAX_CONVERSATION_ROUNDS": "max_conversation_rounds",
+        }.get(key)
+        if attr and hasattr(settings, attr):
+            setattr(settings, attr, val)
+
+    try:
+        with open(_ENV_PATH, "r") as f:
+            lines = f.readlines()
+        with open(_ENV_PATH, "w") as f:
+            for line in lines:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    key = stripped.split("=")[0].strip()
+                    if key in defaults:
+                        f.write(f"{key}={defaults[key]}\n")
+                        continue
+                f.write(line)
+    except Exception:
+        pass
+
+    return {"code": 0, "message": "安全配置已重置为默认值"}
+
+
+@router.get("/telemetry")
+async def get_telemetry(limit: int = 50):
+    """获取 Agent 处理链路性能遥测数据（最近 N 条 + 聚合统计）"""
+    try:
+        from app.services.performance_telemetry import get_recent_telemetry, get_aggregate_stats
+    except ImportError:
+        return {"code": 0, "data": {"count": 0, "message": "遥测服务未启用"}}
+
+    recent = get_recent_telemetry(limit=min(limit, 200))
+    stats = get_aggregate_stats()
+    return {
+        "code": 0,
+        "data": {
+            "recent": recent,
+            "aggregate": stats,
+        },
+    }

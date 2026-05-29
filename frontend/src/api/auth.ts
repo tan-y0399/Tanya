@@ -1,8 +1,10 @@
 import api from './index'
 
 // 账号密码登录
-export async function login(username: string, password: string) {
-  const { data } = await api.post('/auth/login', { username, password })
+export async function login(username: string, password: string, loginRole?: 'admin' | 'user') {
+  const payload: Record<string, string> = { username, password }
+  if (loginRole) payload.loginRole = loginRole
+  const { data } = await api.post('/auth/login', payload)
   return data
 }
 

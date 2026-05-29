@@ -5,7 +5,17 @@
       <p class="page-desc">模型配置、工具管理、安全规则与系统状态监控</p>
     </div>
 
-    <div class="settings-grid">
+    <!-- 加载/错误状态 -->
+    <div v-if="isLoading" class="settings-loading">
+      <div class="loading-spinner"></div>
+      <span>加载配置中...</span>
+    </div>
+    <div v-else-if="loadError" class="settings-error">
+      <span>{{ loadError }}</span>
+      <button @click="initSettings">重试</button>
+    </div>
+
+    <div class="settings-grid" v-else>
       <!-- 模型配置 -->
       <div class="panel card">
         <div class="panel-head">
@@ -153,11 +163,13 @@ import { getConfig, updateConfig, getHealth } from '@/api/system'
 
 const isSaving = ref(false)
 const isRefreshing = ref(false)
+const isLoading = ref(true)
+const loadError = ref('')
 
 const settings = reactive({
   llm: {
-    apiBase: 'https://api.example.com/v1',
-    model: 'qwen-plus',
+    apiBase: '',
+    model: '',
     apiKey: '',
     temperature: 0.1,
     maxTokens: 4096,
@@ -229,14 +241,36 @@ async function saveSettings() {
   }
 }
 
-onMounted(() => {
-  loadHealth()
-  getConfig().then(data => {
-    if (data) {
-      if (data.llm) Object.assign(settings.llm, data.llm)
-      if (data.security) Object.assign(settings.security, data.security)
+async function initSettings() {
+  isLoading.value = true
+  loadError.value = ''
+  try {
+    const [configData, healthData] = await Promise.all([getConfig(), getHealth()])
+    if (configData) {
+      if (configData.llm) Object.assign(settings.llm, configData.llm)
+      if (configData.security) Object.assign(settings.security, configData.security)
     }
-  })
+    if (healthData?.components) {
+      const comps = healthData.components
+      const list: any[] = []
+      if (comps.database) list.push({ name: '数据库', status: comps.database.status === 'up' ? 'online' : 'offline', latency: comps.database.latencyMs })
+      if (comps.llmApi) list.push({ name: 'LLM API', status: comps.llmApi.status === 'up' ? 'online' : 'offline', latency: comps.llmApi.latencyMs })
+      if (comps.mcpServers) {
+        for (const [name, info] of Object.entries(comps.mcpServers) as any) {
+          list.push({ name: `${name} MCP`, status: info?.status === 'up' ? 'online' : 'offline', latency: null })
+        }
+      }
+      if (list.length) components.value = list
+    }
+  } catch {
+    loadError.value = '无法加载配置，请检查后端服务是否运行'
+  } finally {
+    isLoading.value = false
+  }
+}
+
+onMounted(() => {
+  initSettings()
 })
 </script>
 
@@ -386,5 +420,41 @@ onMounted(() => {
 
 .spinning {
   animation: spin 0.8s linear infinite;
+}
+
+.settings-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 60px;
+  color: #94a3b8;
+  gap: 16px;
+  .loading-spinner {
+    width: 36px; height: 36px;
+    border: 3px solid #e2e8f0;
+    border-top-color: #2563eb;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+}
+
+.settings-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  padding: 40px;
+  color: #dc2626;
+  font-size: 14px;
+  button {
+    padding: 8px 20px;
+    border: 1px solid #2563eb;
+    border-radius: 8px;
+    background: #fff;
+    color: #2563eb;
+    font-size: 13px;
+    cursor: pointer;
+    &:hover { background: #eff6ff; }
+  }
 }
 </style>

@@ -11,6 +11,7 @@
     <div class="msg-body">
       <div class="msg-meta">
         <span class="msg-role">KylinOps Agent</span>
+        <span v-if="maxRiskLevel && maxRiskLevel !== 'L1'" class="risk-badge" :class="'risk-' + maxRiskLevel.toLowerCase()">{{ maxRiskLevel }}</span>
         <span class="msg-time">{{ formattedTime }}</span>
       </div>
       <div class="msg-content" v-html="renderedContent"></div>
@@ -34,6 +35,7 @@ const props = defineProps<{
   content: string
   traceId?: string
   createdAt: string
+  maxRiskLevel?: string
 }>()
 
 defineEmits<{ viewTrace: [traceId: string] }>()
@@ -236,5 +238,20 @@ const shortTraceId = computed(() => props.traceId ? props.traceId.slice(0, 28) +
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: translateY(0); }
+}
+
+.risk-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 700;
+  margin-left: 6px;
+
+  &.risk-l1 { background: #ecfdf5; color: #059669; border: 1px solid #a7f3d0; }
+  &.risk-l2 { background: #fffbeb; color: #b45309; border: 1px solid #fde68a; }
+  &.risk-l3 { background: #fef2f2; color: #dc2626; border: 1px solid #fecaca; }
+  &.risk-l4 { background: #fef2f2; color: #991b1b; border: 1px solid #fca5a5; }
+  &.risk-l5 { background: #fef2f2; color: #7f1d1d; border: 1px solid #fca5a5; }
 }
 </style>

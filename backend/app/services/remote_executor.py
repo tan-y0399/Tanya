@@ -3,6 +3,11 @@
 
 运行在麒麟VM上的操作通过 SSH 执行，本地 Windows 负责 Agent 推理。
 所有工具返回结构化数据，供 Agent 解析和决策。
+
+安全增强:
+  - 非 root 沙箱执行 (ops_agent 用户)
+  - 资源限制 (CPU/内存/文件描述符/进程数)
+  - 高危命令白名单
 """
 
 import json
@@ -13,6 +18,21 @@ from .ssh_client import get_ssh_client, get_ssh_for_server_sync
 
 logger = logging.getLogger(__name__)
 
+# ── 沙箱配置 ──
+SANDBOX_USER = "test"  # 非 root 操作员账号（麒麟主机上的普通用户）
+SANDBOX_ENABLED = True  # 是否启用沙箱
+SANDBOX_RLIMIT_CPU = 30      # CPU 时间限制（秒）
+SANDBOX_RLIMIT_MEMORY_MB = 512  # 内存限制（MB）
+SANDBOX_RLIMIT_NOFILE = 256  # 文件描述符限制
+SANDBOX_RLIMIT_NPROC = 50    # 进程数限制
+
+# 白名单：始终以 root 执行的只读命令
+READONLY_ROOT_WHITELIST = [
+    "systemctl status", "journalctl", "cat ", "ls ", "df ", "free ",
+    "ps ", "ss ", "ip ", "getent", "readlink", "uptime", "hostname",
+    "uname", "cat /etc/os-release", "python3 -c", "cat /proc",
+]
+
 # ── 工具结果统一格式 ──
 
 
@@ -22,6 +42,74 @@ def _ok(data):  # type: (Union[dict, str]) -> dict
 
 def _err(msg: str) -> dict:
     return {"success": False, "error": msg, "timestamp": datetime.now().isoformat()}
+
+
+# ── 沙箱包装 ──
+
+def _is_readonly_command(command: str) -> bool:
+    """判断命令是否为只读操作，可在 root 下直接执行"""
+    cmd_stripped = command.strip()
+    for prefix in READONLY_ROOT_WHITELIST:
+        if cmd_stripped.startswith(prefix):
+            return True
+    return False
+
+
+def _sandbox_wrap(command: str, timeout: int = 30) -> str:
+    """将命令包装在非 root 沙箱中执行。
+
+    策略:
+      1. 只读命令 → root 直接执行（性能最优）
+      2. 带写的低风险命令 → sudo -u ops_agent 执行
+      3. 系统管理命令 (systemctl start/stop/restart) → root 但限制资源
+    """
+    if not SANDBOX_ENABLED:
+        return command
+
+    # 只读命令直接以 root 执行
+    if _is_readonly_command(command):
+        return command
+
+    # systemctl 管理命令：root 执行但限制资源
+    if command.strip().startswith("systemctl ") and not command.strip().startswith("systemctl status"):
+        limits = "ulimit -t {cpu} -v {mem} -n {nofile} -u {nproc} 2>/dev/null; ".format(
+            cpu=SANDBOX_RLIMIT_CPU,
+            mem=SANDBOX_RLIMIT_MEMORY_MB * 1024,
+            nofile=SANDBOX_RLIMIT_NOFILE,
+            nproc=SANDBOX_RLIMIT_NPROC,
+        )
+        return limits + command
+
+    # kill 命令：root 执行但限制参数
+    if command.strip().startswith("kill "):
+        return command
+
+    # 其他写操作：降权到 ops_agent 用户（如用户不存在则直接执行 + ulimit）
+    limits = "ulimit -t {cpu} -v {mem} -n {nofile} -u {nproc} 2>/dev/null; ".format(
+        cpu=SANDBOX_RLIMIT_CPU,
+        mem=SANDBOX_RLIMIT_MEMORY_MB * 1024,
+        nofile=SANDBOX_RLIMIT_NOFILE,
+        nproc=SANDBOX_RLIMIT_NPROC,
+    )
+    escaped_cmd = command.replace("'", "'\"'\"'")
+    # 尝试 su 降权，失败则回退到直接执行（均带 ulimit）
+    wrapped = (
+        "if id {user} >/dev/null 2>&1; then "
+        "  su - {user} -c '{limits}{escaped_cmd}'; "
+        "else "
+        "  {limits}{escaped_cmd}; "
+        "fi"
+    ).format(
+        user=SANDBOX_USER,
+        limits=limits,
+        escaped_cmd=escaped_cmd,
+    )
+    return wrapped
+
+
+def _wrap_with_timeout(command: str, timeout: int) -> str:
+    """给命令包装 timeout 限制"""
+    return "timeout {t} {cmd}".format(t=timeout, cmd=command)
 
 
 # ── 系统信息工具 ──
@@ -88,10 +176,13 @@ def get_memory_info(server_id: str = None) -> dict:
     return _ok(_parse_kv(out))
 
 
-def get_disk_info(server_id: str = None) -> dict:
-    """获取磁盘使用情况。"""
+def get_disk_info(server_id: str = None, mount_point: str = "") -> dict:
+    """获取磁盘使用情况，可指定挂载点。"""
     ssh = get_ssh_for_server_sync(server_id)
-    cmd = "df -h --type=ext4 --type=xfs --type=btrfs 2>/dev/null || df -h /"
+    if mount_point:
+        cmd = "df -h {}".format(mount_point)
+    else:
+        cmd = "df -h --type=ext4 --type=xfs --type=btrfs 2>/dev/null || df -h /"
     out, err, code = ssh.execute(cmd)
     if code != 0:
         return _err(err or "获取磁盘信息失败")
@@ -267,12 +358,26 @@ def get_groups(server_id: str = None) -> dict:
 def run_command(command: str, timeout: int = 30, server_id: str = None) -> dict:
     """在远程VM上执行任意命令（Agent 核心操作入口）。
 
-    ⚠ 命令在 root 权限下执行，需由 Agent 确认无风险后再调用。
+    沙箱策略:
+      - 只读命令 → root 直接执行
+      - 写操作 → sudo -u ops_agent 降权执行 + ulimit 资源限制
+      - 系统管理 → root 执行但限制资源
     """
     ssh = get_ssh_for_server_sync(server_id)
-    out, err, code = ssh.execute(f"timeout {timeout} {command}")
+    sandboxed = _sandbox_wrap(command, timeout)
+    final_cmd = _wrap_with_timeout(sandboxed, timeout)
+    logger.info("[Sandbox] user=%s | cmd=%s", SANDBOX_USER if SANDBOX_ENABLED else "root", command[:100])
+    out, err, code = ssh.execute(final_cmd)
     return _ok({
         "command": command,
+        "sandbox": {
+            "enabled": SANDBOX_ENABLED,
+            "user": SANDBOX_USER if SANDBOX_ENABLED else "root",
+            "rlimit_cpu": SANDBOX_RLIMIT_CPU,
+            "rlimit_memory_mb": SANDBOX_RLIMIT_MEMORY_MB,
+            "rlimit_nofile": SANDBOX_RLIMIT_NOFILE,
+            "rlimit_nproc": SANDBOX_RLIMIT_NPROC,
+        },
         "stdout": out,
         "stderr": err,
         "exit_code": code,

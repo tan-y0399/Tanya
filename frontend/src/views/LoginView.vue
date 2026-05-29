@@ -24,6 +24,25 @@
         <p class="brand-sub">麒麟智能运维 Agent</p>
       </div>
 
+      <div class="role-tabs" role="tablist" aria-label="登录角色切换">
+        <button
+          class="role-tab"
+          :class="{ active: activeRole === 'admin' }"
+          type="button"
+          @click="activeRole = 'admin'"
+        >
+          管理员登录
+        </button>
+        <button
+          class="role-tab"
+          :class="{ active: activeRole === 'user' }"
+          type="button"
+          @click="activeRole = 'user'"
+        >
+          用户登录
+        </button>
+      </div>
+
       <div class="form-area">
         <div class="field">
           <label>用户名</label>
@@ -31,7 +50,7 @@
             v-model="username"
             type="text"
             class="text-input"
-            placeholder="请输入用户名"
+            :placeholder="activeRole === 'admin' ? '请输入管理员用户名' : '请输入用户名'"
             @keyup.enter="handleLogin"
           />
         </div>
@@ -41,14 +60,17 @@
             v-model="password"
             type="password"
             class="text-input"
-            placeholder="请输入密码"
+            :placeholder="activeRole === 'admin' ? '请输入管理员密码' : '请输入密码'"
             @keyup.enter="handleLogin"
           />
         </div>
-        <div class="hint">默认管理员 admin / admin123</div>
+        <div class="hint">
+          {{ activeRole === 'admin' ? '默认管理员 admin / admin123' : '默认用户 lk / lk666' }}
+        </div>
         <button class="login-btn" :disabled="loading" @click="handleLogin">
-          {{ loading ? '验证中...' : '登 录' }}
+          {{ loading ? '验证中...' : activeRoleLabel }}
         </button>
+        <router-link class="register-link" to="/register">没有账号？去注册 →</router-link>
       </div>
 
       <div class="error-msg" v-if="errorMsg">{{ errorMsg }}</div>
@@ -57,7 +79,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
 import { login } from '@/api/auth'
@@ -67,6 +89,8 @@ const userStore = useUserStore()
 
 const username = ref('admin')
 const password = ref('')
+const activeRole = ref<'admin' | 'user'>('admin')
+const activeRoleLabel = computed(() => (activeRole.value === 'admin' ? '管理员登录' : '用户登录'))
 const loading = ref(false)
 const errorMsg = ref('')
 
@@ -77,18 +101,35 @@ async function handleLogin() {
     return
   }
   loading.value = true
+
+  // 安全超时：10 秒后自动重置，防止一直转圈
+  const safetyTimer = setTimeout(() => {
+    if (loading.value) {
+      loading.value = false
+      errorMsg.value = '登录超时，请检查网络连接后重试'
+    }
+  }, 10000)
+
   try {
-    const res = await login(username.value, password.value)
+    const res = await login(username.value, password.value, activeRole.value)
+    clearTimeout(safetyTimer)
     if (res.code === 0) {
+      const userRole = res.data.user?.role
       userStore.setToken(res.data.accessToken)
       userStore.setUserInfo(res.data.user)
-      router.push('/dashboard')
+      router.push(userRole === 'admin' ? '/knowledge' : '/chat')
     } else {
       errorMsg.value = res.message || '登录失败'
     }
   } catch (e: any) {
-    errorMsg.value = e?.response?.data?.detail || '登录失败，请检查用户名和密码'
+    clearTimeout(safetyTimer)
+    if (e?.code === 'ERR_NETWORK' || e?.code === 'ECONNABORTED' || !e?.response) {
+      errorMsg.value = '无法连接服务器，请确认后端已启动'
+    } else {
+      errorMsg.value = e?.response?.data?.detail || '登录失败，请检查用户名和密码'
+    }
   } finally {
+    clearTimeout(safetyTimer)
     loading.value = false
   }
 }
@@ -120,10 +161,38 @@ async function handleLogin() {
 }
 
 .login-header {
-  text-align: center; margin-bottom: 32px;
+  text-align: center; margin-bottom: 24px;
   .brand { margin-bottom: 8px; }
   .brand-title { font-size: 22px; font-weight: 700; color: #1e293b; letter-spacing: 2px; margin: 0; }
   .brand-sub { font-size: 12px; color: #94a3b8; margin: 4px 0 0; }
+}
+
+.role-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 20px;
+  padding: 6px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+}
+
+.role-tab {
+  border: none;
+  background: transparent;
+  color: #64748b;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 10px 12px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.2s;
+  &.active {
+    background: linear-gradient(135deg, #2563eb, #4f46e5);
+    color: #fff;
+    box-shadow: 0 4px 14px rgba(37,99,235,0.18);
+  }
 }
 
 .form-area {
@@ -151,6 +220,16 @@ async function handleLogin() {
   cursor: pointer; transition: all 0.2s;
   &:hover:not(:disabled) { box-shadow: 0 4px 16px rgba(37,99,235,0.3); transform: translateY(-1px); }
   &:disabled { opacity: 0.5; cursor: not-allowed; }
+}
+
+.register-link {
+  text-align: center;
+  color: #2563eb;
+  font-size: 13px;
+  font-weight: 500;
+  text-decoration: none;
+  transition: color 0.2s;
+  &:hover { color: #6366f1; }
 }
 
 .error-msg {

@@ -10,7 +10,6 @@
         @selectSession="handleSelectSession"
         @deleteSession="handleDeleteSession"
       />
-      <!-- 收起时只保留展开按钮 -->
       <div v-else class="sidebar-collapsed-handle">
         <button class="expand-btn" @click="toggleSidebar" title="展开会话列表">
           <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
@@ -31,6 +30,17 @@
             </svg>
           </button>
           <span class="topbar-title" v-if="chatStore.messages.length">{{ chatStore.currentSessionId?.slice(0,12) || '' }}</span>
+          <!-- 意图标签 -->
+          <span v-if="chatStore.currentIntent" class="intent-tag" :class="'intent-' + chatStore.currentIntent">
+            {{ intentLabel(chatStore.currentIntent) }}
+          </span>
+          <!-- 当前阶段指示器 -->
+          <span v-if="chatStore.currentStage && chatStore.isStreaming" class="stage-indicator">
+            <span class="stage-dot" :style="{ background: stageColor }"></span>
+            {{ stageLabel(chatStore.currentStage) }}
+          </span>
+          <!-- 注入警告 -->
+          <span v-if="chatStore.injectionWarning" class="injection-warning-tag">安全警告</span>
           <!-- 服务器选择器 -->
           <div class="server-selector">
             <svg width="14" height="14" viewBox="0 0 14 14" fill="none" class="server-icon">
@@ -55,6 +65,7 @@
           清空对话
         </button>
       </div>
+
       <div class="chat-messages" ref="msgContainer">
         <div class="welcome-area" v-if="!chatStore.messages.length">
           <div class="welcome-icon">
@@ -71,7 +82,7 @@
             </svg>
           </div>
           <h1 class="welcome-title">KylinOps 智能运维 Agent</h1>
-          <p class="welcome-desc">基于 ReAct / Plan-Execute 混合推理架构，通过自然语言完成运维巡检、故障排查与资源管理</p>
+          <p class="welcome-desc">基于 LangGraph ReAct 架构，通过自然语言完成运维巡检、故障排查与资源管理</p>
           <div class="quick-actions">
             <button v-for="qa in quickActions" :key="qa" class="quick-btn" @click="handleQuickAction(qa)">
               {{ qa }}
@@ -80,49 +91,60 @@
         </div>
 
         <div v-for="group in groupedMessages" :key="group.id">
-        <!-- 用户消息 -->
-        <div v-if="group.type === 'user'" class="msg-wrapper msg-user">
-          <button class="msg-delete-btn" @click="handleDeleteMessage(group.id)" title="删除">
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-              <path d="M2 2l6 6M8 2l-6 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-            </svg>
-          </button>
-          <UserMessage :content="group.msg.content" :createdAt="group.msg.createdAt" />
-        </div>
+          <!-- 用户消息 -->
+          <div v-if="group.type === 'user'" class="msg-wrapper msg-user">
+            <button class="msg-delete-btn" @click="handleDeleteMessage(group.id)" title="删除">
+              <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+                <path d="M2 2l6 6M8 2l-6 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+              </svg>
+            </button>
+            <UserMessage :content="group.msg.content" :createdAt="group.msg.createdAt" />
+          </div>
 
-        <!-- Agent消息 + 工具结果嵌入在同一个气泡内 -->
-        <div v-else-if="group.type === 'agent'" class="msg-wrapper msg-assistant">
-          <button class="msg-delete-btn" @click="handleDeleteMessage(group.id)" title="删除">
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-              <path d="M2 2l6 6M8 2l-6 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-            </svg>
-          </button>
-          <AgentMessage
-            :content="group.msg.content"
-            :traceId="group.msg.traceId"
-            :createdAt="group.msg.createdAt"
-            @viewTrace="openTraceTimeline"
-          />
-          <!-- 工具结果嵌入在Agent回答下方 -->
-          <ToolCallCard
-            v-for="tc in group.tools"
-            :key="tc.id"
-            :tool="tc"
-            @viewDetail="openToolDetail"
-          />
-        </div>
+          <!-- Agent消息 + 推理链 + 状态卡片 + 工具结果 -->
+          <div v-else-if="group.type === 'agent'" class="msg-wrapper msg-assistant">
+            <button class="msg-delete-btn" @click="handleDeleteMessage(group.id)" title="删除">
+              <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+                <path d="M2 2l6 6M8 2l-6 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+              </svg>
+            </button>
+            <!-- 推理链（可折叠） -->
+            <ReasoningChain
+              v-if="chatStore.reasoningSteps.length && group === lastAgentGroup"
+              :steps="chatStore.reasoningSteps"
+            />
+            <!-- 状态卡片 -->
+            <StateCards
+              v-if="chatStore.stateCards.length && group === lastAgentGroup"
+              :cards="chatStore.stateCards"
+              :riskColor="chatStore.riskColor"
+            />
+            <AgentMessage
+              :content="group.msg.content"
+              :traceId="group.msg.traceId"
+              :createdAt="group.msg.createdAt"
+              @viewTrace="openTraceTimeline"
+            />
+            <!-- 工具结果嵌入在Agent回答下方 -->
+            <ToolCallCard
+              v-for="tc in group.tools"
+              :key="tc.id"
+              :tool="tc"
+              @viewDetail="openToolDetail"
+            />
+          </div>
 
-        <!-- 系统消息 -->
-        <div v-else-if="group.type === 'system'" class="msg-wrapper msg-system">
-          <div class="system-msg">
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" class="sys-icon">
-              <path d="M7 5v3M7 10.5v.5" stroke="#b45309" stroke-width="1.2" stroke-linecap="round"/>
-              <circle cx="7" cy="7" r="6" stroke="#b45309" stroke-width="1.2"/>
-            </svg>
-            <span>{{ group.msg.content }}</span>
+          <!-- 系统消息 -->
+          <div v-else-if="group.type === 'system'" class="msg-wrapper msg-system">
+            <div class="system-msg">
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" class="sys-icon">
+                <path d="M7 5v3M7 10.5v.5" stroke="#b45309" stroke-width="1.2" stroke-linecap="round"/>
+                <circle cx="7" cy="7" r="6" stroke="#b45309" stroke-width="1.2"/>
+              </svg>
+              <span>{{ group.msg.content }}</span>
+            </div>
           </div>
         </div>
-      </div>
 
         <!-- 流式输出指示器 -->
         <div v-if="chatStore.isStreaming" class="streaming-bar">
@@ -148,18 +170,27 @@
           </div>
           <div class="approval-bar-actions">
             <template v-if="pendingAction.type === 'approval'">
-              <button class="apv-btn apv-btn-approve" @click="handleApprove">
-                <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-                  <path d="M3 7l3 3 5-6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+              <template v-if="isAdmin">
+                <button class="apv-btn apv-btn-approve" @click="handleApprove">
+                  <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                    <path d="M3 7l3 3 5-6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                  审批通过
+                </button>
+                <button class="apv-btn apv-btn-reject" @click="handleReject">
+                  <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                    <path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                  </svg>
+                  拒绝
+                </button>
+              </template>
+              <div v-else class="awaiting-admin">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                  <circle cx="8" cy="8" r="7" stroke="#d97706" stroke-width="1.3"/>
+                  <path d="M8 4.5v4M8 11.5v.5" stroke="#d97706" stroke-width="1.3" stroke-linecap="round"/>
                 </svg>
-                审批通过
-              </button>
-              <button class="apv-btn apv-btn-reject" @click="handleReject">
-                <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-                  <path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-                </svg>
-                拒绝
-              </button>
+                <span>此操作需管理员审批，正在自动检查审批状态...</span>
+              </div>
             </template>
             <template v-else>
               <button class="apv-btn apv-btn-approve" @click="handleConfirm">
@@ -199,15 +230,16 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, nextTick, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useChatStore } from '@/stores/chat'
+import { useUserStore } from '@/stores/user'
 import type { ToolCall, Message } from '@/stores/chat'
 import {
   getSessions, createSession, deleteSession, getMessages, sendMessage,
   clearSessionMessages, deleteMessage,
 } from '@/api/chat'
-import { approveApproval, rejectApproval } from '@/api/approval'
+import { approveApproval, rejectApproval, getPendingApprovals } from '@/api/approval'
 import { getServers, type ServerInfo } from '@/api/servers'
 import SessionList from '@/components/chat/SessionList.vue'
 import UserMessage from '@/components/chat/UserMessage.vue'
@@ -215,13 +247,17 @@ import AgentMessage from '@/components/chat/AgentMessage.vue'
 import ToolCallCard from '@/components/chat/ToolCallCard.vue'
 import ChatInput from '@/components/chat/ChatInput.vue'
 import DetailPanel from '@/components/chat/DetailPanel.vue'
+import ReasoningChain from '@/components/chat/ReasoningChain.vue'
+import StateCards from '@/components/chat/StateCards.vue'
 
 const route = useRoute()
 const chatStore = useChatStore()
+const userStore = useUserStore()
 const msgContainer = ref<HTMLElement>()
+
+const isAdmin = computed(() => userStore.userInfo?.role === 'admin')
 const abortController = ref<AbortController | null>(null)
 
-// 侧边栏状态
 const sidebarCollapsed = ref(false)
 
 function toggleSidebar() {
@@ -243,21 +279,34 @@ async function loadServerList() {
   try {
     const data = await getServers()
     serverList.value = data?.items || []
-    // 默认选中标记为 isDefault=true 的服务器，没有的话选第一个
     if (serverList.value.length > 0) {
       const defaultServer = serverList.value.find(s => s.isDefault)
-      if (defaultServer) {
-        selectedServerId.value = defaultServer.id
-      } else {
-        selectedServerId.value = serverList.value[0].id
-      }
+      selectedServerId.value = defaultServer ? defaultServer.id : serverList.value[0].id
     }
   } catch {}
 }
 
-function handleServerChange() {
-  // 切换目标服务器
+function handleServerChange() {}
+
+// 阶段指示器
+const stageLabels: Record<string, string> = {
+  intent_filter: '意图分析', parallel_process: '知识检索', fusion: '上下文融合',
+  dialog_manage: '对话管理', reasoning: '推理决策', safety_check: '安全校验',
+  tool_execution: '工具执行', response_assembly: '响应组装',
 }
+
+function stageLabel(stage: string): string {
+  return stageLabels[stage] || stage
+}
+
+const stageColor = computed(() => {
+  const stage = chatStore.currentStage
+  if (stage === 'safety_check') return '#f59e0b'
+  if (stage === 'tool_execution') return '#3b82f6'
+  if (stage === 'reasoning') return '#8b5cf6'
+  if (stage === 'response_assembly') return '#10b981'
+  return '#2563eb'
+})
 
 // 右侧面板
 const panelVisible = ref(false)
@@ -279,8 +328,34 @@ interface PendingAction {
   resolved: boolean
 }
 const pendingAction = ref<PendingAction | null>(null)
+const pollTimer = ref<ReturnType<typeof setInterval> | null>(null)
 
-// 消息分组：将 assistant + 后续 tool_call 合并为一个 agent 组
+function startApprovalPolling(approvalId: string) {
+  stopApprovalPolling()
+  pollTimer.value = setInterval(async () => {
+    try {
+      const data = await getPendingApprovals()
+      const items = data?.items || []
+      const stillPending = items.find((item: any) => item.id === approvalId)
+      if (!stillPending) {
+        // 审批已处理（通过或拒绝），检查状态并恢复
+        stopApprovalPolling()
+        if (!pendingAction.value || pendingAction.value.resolved) return
+        pendingAction.value.resolved = true
+        handleSend('', { approvalId })
+      }
+    } catch {}
+  }, 3000)
+}
+
+function stopApprovalPolling() {
+  if (pollTimer.value) {
+    clearInterval(pollTimer.value)
+    pollTimer.value = null
+  }
+}
+
+// 消息分组
 const groupedMessages = computed(() => {
   const raw = chatStore.messages
   const groups: { id: string; type: string; msg: Message; tools: ToolCall[] }[] = []
@@ -303,7 +378,6 @@ const groupedMessages = computed(() => {
       groups.push({ id: msg.id, type: 'system', msg, tools: [] })
       i++
     } else {
-      // 孤立的 tool_call（没有前面的 assistant），单独展示
       const tc = (msg.toolCalls || []) as ToolCall[]
       groups.push({ id: msg.id, type: 'agent', msg: { ...msg, content: '' }, tools: tc })
       i++
@@ -312,12 +386,31 @@ const groupedMessages = computed(() => {
   return groups
 })
 
+// 最后一个 Agent 消息组（用于显示推理链和状态卡片）
+const lastAgentGroup = computed(() => {
+  const groups = groupedMessages.value
+  for (let i = groups.length - 1; i >= 0; i--) {
+    if (groups[i].type === 'agent') return groups[i]
+  }
+  return null
+})
+
 const quickActions = [
   '查看磁盘使用情况',
   '检查系统内存状态',
   '列出占用CPU最高的进程',
   '查看网络连接状态',
 ]
+
+const intentLabels: Record<string, string> = {
+  general_qa: '普通问答', knowledge_qa: '知识查询',
+  ops_query: '运维查询', fault_analysis: '故障分析',
+  high_risk: '高风险操作', prompt_injection: '注入拦截',
+}
+
+function intentLabel(intent: string): string {
+  return intentLabels[intent] || intent
+}
 
 function scrollToBottom() {
   nextTick(() => {
@@ -334,22 +427,22 @@ async function loadSessions() {
 }
 
 async function handleNewSession() {
-  // 如果有正在进行的对话，先取消
   abortController.value?.abort()
   chatStore.setStreaming(false)
   try {
     const data = await createSession()
     chatStore.setCurrentSession(data.id)
     chatStore.setMessages([])
+    chatStore.resetAgentState()
     await loadSessions()
   } catch {}
 }
 
 async function handleSelectSession(id: string) {
-  // 切换会话时取消当前流式输出
   abortController.value?.abort()
   chatStore.setStreaming(false)
   chatStore.setCurrentSession(id)
+  chatStore.resetAgentState()
   try {
     const data = await getMessages(id)
     chatStore.setMessages(data.items || [])
@@ -378,28 +471,21 @@ async function handleSend(text: string, pendingData?: { approvalId?: string; pen
   const isResume = !!(pendingData?.approvalId || pendingData?.pendingExecutionId)
 
   if (!isResume) {
-    // 正常消息：添加用户消息气泡
     const msgId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
     const userMsg: Message = {
-      id: msgId,
-      role: 'user',
-      content: text,
-      createdAt: new Date().toISOString(),
+      id: msgId, role: 'user', content: text, createdAt: new Date().toISOString(),
     }
     chatStore.addMessage(userMsg)
+    chatStore.resetAgentState()
   }
 
-  // 清除待处理操作
   pendingAction.value = null
   chatStore.setStreaming(true)
 
   const assistantMsgId = Date.now().toString(36) + '-a-' + Math.random().toString(36).slice(2, 10)
   if (!isResume) {
     const assistantMsg: Message = {
-      id: assistantMsgId,
-      role: 'assistant',
-      content: '',
-      createdAt: new Date().toISOString(),
+      id: assistantMsgId, role: 'assistant', content: '', createdAt: new Date().toISOString(),
     }
     chatStore.addMessage(assistantMsg)
   }
@@ -408,114 +494,137 @@ async function handleSend(text: string, pendingData?: { approvalId?: string; pen
   abortController.value = sendMessage(
     chatStore.currentSessionId!,
     isResume ? '(resume)' : text,
-    (token: string) => {
-      chatStore.appendToLastMessage(token)
-      scrollToBottom()
-    },
-    (tool: any) => {
-      const status = tool.status || 'executing'
-      const tc: ToolCall = {
-        id: tool.id || Date.now().toString(36),
-        toolName: tool.toolName,
-        params: tool.params || {},
-        riskLevel: tool.riskLevel || 'L1',
-        status: status as ToolCall['status'],
-      }
-      const toolMsg: Message = {
-        id: Date.now().toString(36) + '-tc-' + Math.random().toString(36).slice(2, 10),
-        role: 'tool_call',
-        content: '',
-        toolCalls: [tc],
-        createdAt: new Date().toISOString(),
-      }
-      chatStore.addMessage(toolMsg)
-      scrollToBottom()
-    },
-    (result: any) => {
-      const msgs = chatStore.messages
-      for (let i = msgs.length - 1; i >= 0; i--) {
-        if (msgs[i].role === 'tool_call' && msgs[i].toolCalls?.length) {
-          const tc = msgs[i].toolCalls![0]
-          tc.status = result.status || 'completed'
-          tc.result = result.result
-          openToolDetail(tc)
-          break
+    {
+      onToken: (token: string) => {
+        chatStore.appendToLastMessage(token)
+        scrollToBottom()
+      },
+      onToolCall: (tool: any) => {
+        const tc: ToolCall = {
+          id: tool.id || Date.now().toString(36),
+          toolName: tool.toolName,
+          params: tool.params || {},
+          riskLevel: tool.riskLevel || 'L1',
+          status: (tool.status || 'executing') as ToolCall['status'],
         }
-      }
-    },
-    // need_approval 事件
-    (approval: any) => {
-      pendingAction.value = {
-        type: 'approval',
-        approvalId: approval.approvalId,
-        toolName: approval.toolName,
-        params: approval.params || {},
-        riskLevel: approval.riskLevel,
-        message: approval.message,
-        expiresAt: approval.expiresAt,
-        resolved: false,
-      }
-      // 也添加系统消息
-      const appMsg: Message = {
-        id: Date.now().toString(36) + '-apv-' + Math.random().toString(36).slice(2, 10),
-        role: 'system',
-        content: approval.message,
-        createdAt: new Date().toISOString(),
-      }
-      chatStore.addMessage(appMsg)
-      chatStore.setStreaming(false)
-    },
-    // need_confirm 事件
-    (confirm: any) => {
-      pendingAction.value = {
-        type: 'confirm',
-        pendingExecutionId: confirm.pendingExecutionId,
-        toolName: confirm.toolName,
-        params: confirm.params || {},
-        riskLevel: confirm.riskLevel,
-        message: confirm.message,
-        resolved: false,
-      }
-      const appMsg: Message = {
-        id: Date.now().toString(36) + '-cfm-' + Math.random().toString(36).slice(2, 10),
-        role: 'system',
-        content: confirm.message,
-        createdAt: new Date().toISOString(),
-      }
-      chatStore.addMessage(appMsg)
-      chatStore.setStreaming(false)
-    },
-    // blocked 事件
-    (blocked: any) => {
-      const appMsg: Message = {
-        id: Date.now().toString(36) + '-blk-' + Math.random().toString(36).slice(2, 10),
-        role: 'system',
-        content: `已阻止: ${blocked.message}`,
-        createdAt: new Date().toISOString(),
-      }
-      chatStore.addMessage(appMsg)
-    },
-    (err: any) => {
-      const errMsg: Message = {
-        id: Date.now().toString(36) + '-err-' + Math.random().toString(36).slice(2, 10),
-        role: 'system',
-        content: `操作失败: ${err?.message || '未知错误'}`,
-        createdAt: new Date().toISOString(),
-      }
-      chatStore.addMessage(errMsg)
-      chatStore.setStreaming(false)
-      pendingAction.value = null
-    },
-    (result: any) => {
-      if (result.traceId) chatStore.setCurrentTraceId(result.traceId)
-      chatStore.setStreaming(false)
-      loadSessions()
-      scrollToBottom()
-
-      // 如果又产生了 pending action (审批恢复后再次遇到需审批的操作)，流已经停了
-      if (pendingAction.value && !pendingAction.value.resolved) {
-        // pending action 会通过 need_approval/need_confirm 事件设置
-      }
+        chatStore.addMessage({
+          id: Date.now().toString(36) + '-tc-' + Math.random().toString(36).slice(2, 10),
+          role: 'tool_call', content: '', toolCalls: [tc],
+          createdAt: new Date().toISOString(),
+        })
+        scrollToBottom()
+      },
+      onToolResult: (result: any) => {
+        const msgs = chatStore.messages
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          if (msgs[i].role === 'tool_call' && msgs[i].toolCalls?.length) {
+            const tc = msgs[i].toolCalls![0]
+            tc.status = result.status || 'completed'
+            tc.result = result.result
+            openToolDetail(tc)
+            break
+          }
+        }
+      },
+      onApprovalRequired: (approval: any) => {
+        pendingAction.value = {
+          type: 'approval', approvalId: approval.approvalId,
+          toolName: approval.toolName, params: approval.params || {},
+          riskLevel: approval.riskLevel, message: approval.message,
+          expiresAt: approval.expiresAt, resolved: false,
+        }
+        chatStore.addMessage({
+          id: Date.now().toString(36) + '-apv-' + Math.random().toString(36).slice(2, 10),
+          role: 'system', content: approval.message, createdAt: new Date().toISOString(),
+        })
+        chatStore.setStreaming(false)
+        // 非管理员自动轮询审批状态
+        if (!isAdmin.value) {
+          startApprovalPolling(approval.approvalId)
+        }
+      },
+      onConfirmRequired: (confirm: any) => {
+        pendingAction.value = {
+          type: 'confirm', pendingExecutionId: confirm.pendingExecutionId,
+          toolName: confirm.toolName, params: confirm.params || {},
+          riskLevel: confirm.riskLevel, message: confirm.message, resolved: false,
+        }
+        chatStore.addMessage({
+          id: Date.now().toString(36) + '-cfm-' + Math.random().toString(36).slice(2, 10),
+          role: 'system', content: confirm.message, createdAt: new Date().toISOString(),
+        })
+        chatStore.setStreaming(false)
+      },
+      onBlocked: (blocked: any) => {
+        chatStore.addMessage({
+          id: Date.now().toString(36) + '-blk-' + Math.random().toString(36).slice(2, 10),
+          role: 'system', content: `已阻止: ${blocked.message}`, createdAt: new Date().toISOString(),
+        })
+      },
+      onIntent: (intent: any) => {
+        chatStore.setCurrentIntent(intent.intent)
+      },
+      onPromptInjection: (injection: any) => {
+        chatStore.setInjectionWarning(injection.message)
+        if (injection.blocked) {
+          chatStore.addMessage({
+            id: Date.now().toString(36) + '-inj-' + Math.random().toString(36).slice(2, 10),
+            role: 'system', content: `安全拦截: ${injection.message}`, createdAt: new Date().toISOString(),
+          })
+          chatStore.setStreaming(false)
+        }
+      },
+      onRiskNotice: (notice: any) => {
+        chatStore.addMessage({
+          id: Date.now().toString(36) + '-risk-' + Math.random().toString(36).slice(2, 10),
+          role: 'system', content: notice.message, createdAt: new Date().toISOString(),
+        })
+      },
+      onPermissionNotice: (permNotice: any) => {
+        console.warn('Permission restriction:', permNotice)
+      },
+      // LangGraph 新事件
+      onStageUpdate: (stage: any) => {
+        if (stage.state?.current_stage) {
+          chatStore.setCurrentStage(stage.state.current_stage)
+        }
+      },
+      onReasoningStep: (step: any) => {
+        if (step.steps) {
+          chatStore.setReasoningSteps(step.steps)
+        }
+      },
+      onReasoningChain: (chain: any) => {
+        if (chain.steps) {
+          chatStore.setReasoningSteps(chain.steps)
+        }
+      },
+      onStateCards: (cards: any) => {
+        if (cards.cards) {
+          chatStore.setStateCards(cards.cards)
+        }
+        if (cards.risk_color) {
+          chatStore.setRiskColor(cards.risk_color)
+        }
+      },
+      onError: (err: any) => {
+        chatStore.addMessage({
+          id: Date.now().toString(36) + '-err-' + Math.random().toString(36).slice(2, 10),
+          role: 'system', content: `操作失败: ${err?.message || '未知错误'}`,
+          createdAt: new Date().toISOString(),
+        })
+        chatStore.setStreaming(false)
+        stopApprovalPolling()
+        pendingAction.value = null
+      },
+      onDone: (result: any) => {
+        if (result.traceId) chatStore.setCurrentTraceId(result.traceId)
+        chatStore.setStreaming(false)
+        stopApprovalPolling()
+        pendingAction.value = null
+        loadSessions()
+        scrollToBottom()
+      },
     },
     pendingData?.approvalId,
     pendingData?.pendingExecutionId,
@@ -527,27 +636,25 @@ function handleStop() {
   abortController.value?.abort()
   chatStore.setStreaming(false)
   pendingAction.value = null
+  stopApprovalPolling()
 }
 
-// 审批/确认 处理
 async function handleApprove() {
   if (!pendingAction.value || pendingAction.value.type !== 'approval') return
   const approvalId = pendingAction.value.approvalId
   if (!approvalId) return
-
   try {
     await approveApproval(approvalId, '通过')
+    stopApprovalPolling()
     pendingAction.value.resolved = true
-    // 恢复执行
     handleSend('', { approvalId })
-  } catch {
-    const errMsg: Message = {
+  } catch (e: any) {
+    chatStore.addMessage({
       id: Date.now().toString(36) + '-err-' + Math.random().toString(36).slice(2, 10),
       role: 'system',
-      content: '审批操作失败，请重试',
+      content: '审批操作失败: ' + (e?.response?.data?.detail || e?.message || '请重试'),
       createdAt: new Date().toISOString(),
-    }
-    chatStore.addMessage(errMsg)
+    })
   }
 }
 
@@ -555,26 +662,21 @@ async function handleReject() {
   if (!pendingAction.value || pendingAction.value.type !== 'approval') return
   const approvalId = pendingAction.value.approvalId
   if (!approvalId) return
-
   try {
     await rejectApproval(approvalId, '拒绝')
+    stopApprovalPolling()
     pendingAction.value.resolved = true
     pendingAction.value = null
-    const appMsg: Message = {
+    chatStore.addMessage({
       id: Date.now().toString(36) + '-rej-' + Math.random().toString(36).slice(2, 10),
-      role: 'system',
-      content: '操作已被拒绝',
-      createdAt: new Date().toISOString(),
-    }
-    chatStore.addMessage(appMsg)
-  } catch {
-    const errMsg: Message = {
+      role: 'system', content: '操作已被拒绝', createdAt: new Date().toISOString(),
+    })
+  } catch (e: any) {
+    chatStore.addMessage({
       id: Date.now().toString(36) + '-err-' + Math.random().toString(36).slice(2, 10),
-      role: 'system',
-      content: '审批操作失败，请重试',
+      role: 'system', content: '审批操作失败: ' + (e?.response?.data?.detail || e?.message || '请重试'),
       createdAt: new Date().toISOString(),
-    }
-    chatStore.addMessage(errMsg)
+    })
   }
 }
 
@@ -582,23 +684,19 @@ async function handleConfirm() {
   if (!pendingAction.value || pendingAction.value.type !== 'confirm') return
   const peId = pendingAction.value.pendingExecutionId
   if (!peId) return
-
   pendingAction.value.resolved = true
-  // 恢复执行（确认操作不需要额外审批）
   handleSend('', { pendingExecutionId: peId })
 }
 
 function handleCancel() {
   if (!pendingAction.value) return
+  stopApprovalPolling()
   pendingAction.value.resolved = true
   pendingAction.value = null
-  const appMsg: Message = {
+  chatStore.addMessage({
     id: Date.now().toString(36) + '-ccl-' + Math.random().toString(36).slice(2, 10),
-    role: 'system',
-    content: '操作已取消',
-    createdAt: new Date().toISOString(),
-  }
-  chatStore.addMessage(appMsg)
+    role: 'system', content: '操作已取消', createdAt: new Date().toISOString(),
+  })
 }
 
 async function handleClearMessages() {
@@ -606,6 +704,7 @@ async function handleClearMessages() {
   try {
     await clearSessionMessages(chatStore.currentSessionId)
     chatStore.setMessages([])
+    chatStore.resetAgentState()
   } catch {}
 }
 
@@ -623,12 +722,24 @@ function handleQuickAction(action: string) {
 function openTraceTimeline(traceId: string) {
   panelTitle.value = '推理链路 · ' + traceId.slice(0, 16) + '...'
   panelMode.value = 'trace'
-  traceEvents.value = [
+  // 用真实的推理步骤构建时间线
+  const events: any[] = []
+  if (chatStore.currentIntent) {
+    events.push({ type: 'user', label: '意图识别', time: '', detail: chatStore.currentIntent })
+  }
+  for (const step of chatStore.reasoningSteps) {
+    events.push({
+      type: 'llm', label: `推理步骤 ${step.step}`,
+      time: '', detail: step.thought || step.action || '',
+    })
+  }
+  if (chatStore.currentStage) {
+    events.push({ type: 'security', label: '安全校验', time: '', detail: chatStore.currentStage })
+  }
+  traceEvents.value = events.length ? events : [
     { type: 'user', label: '用户消息', time: '', detail: '' },
     { type: 'llm', label: 'LLM 推理', time: '', detail: '模型分析意图...' },
     { type: 'security', label: '安全校验', time: '', detail: '静态规则: PASSED' },
-    { type: 'tool', label: '工具执行', time: '', detail: '工具调用完成' },
-    { type: 'llm', label: '生成回复', time: '', detail: '汇总结果' },
   ]
   panelVisible.value = true
 }
@@ -640,6 +751,33 @@ function openToolDetail(tool: ToolCall) {
   panelVisible.value = true
 }
 
+onUnmounted(() => {
+  stopApprovalPolling()
+})
+
+async function restorePendingApproval(sessionId: string) {
+  try {
+    const data = await getPendingApprovals()
+    const items = data?.items || []
+    const match = items.find((item: any) => item.sessionId === sessionId)
+    if (match) {
+      pendingAction.value = {
+        type: 'approval',
+        approvalId: match.id,
+        toolName: match.toolName,
+        params: match.toolParams || {},
+        riskLevel: match.riskLevel,
+        message: match.detail || '此操作需要管理员审批',
+        expiresAt: match.expiresAt,
+        resolved: false,
+      }
+      if (!isAdmin.value) {
+        startApprovalPolling(match.id)
+      }
+    }
+  } catch {}
+}
+
 onMounted(async () => {
   await loadServerList()
   await loadSessions()
@@ -649,6 +787,7 @@ onMounted(async () => {
       const data = await getMessages(route.params.id as string)
       chatStore.setMessages(data.items || [])
     } catch {}
+    await restorePendingApproval(route.params.id as string)
   }
 })
 
@@ -659,6 +798,7 @@ watch(() => route.params.id, async (id) => {
       const data = await getMessages(id as string)
       chatStore.setMessages(data.items || [])
     } catch {}
+    await restorePendingApproval(id as string)
     scrollToBottom()
   }
 })
@@ -740,6 +880,30 @@ watch(() => route.params.id, async (id) => {
   }
 }
 
+.stage-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px;
+  border-radius: 12px;
+  background: #f1f5f9;
+  font-size: 12px;
+  color: #475569;
+  margin-left: 8px;
+
+  .stage-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    animation: pulse-dot 1.5s infinite;
+  }
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
 .server-selector {
   display: flex;
   align-items: center;
@@ -809,9 +973,7 @@ watch(() => route.params.id, async (id) => {
 
 .msg-wrapper {
   position: relative;
-  &:hover .msg-delete-btn {
-    opacity: 1;
-  }
+  &:hover .msg-delete-btn { opacity: 1; }
 }
 
 .msg-delete-btn {
@@ -987,6 +1149,19 @@ watch(() => route.params.id, async (id) => {
   gap: 10px;
 }
 
+.awaiting-admin {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #92400e;
+  svg { flex-shrink: 0; }
+}
+
 .apv-btn {
   display: flex;
   align-items: center;
@@ -1012,5 +1187,42 @@ watch(() => route.params.id, async (id) => {
     border-color: #fecaca;
     &:hover { background: #fef2f2; }
   }
+}
+
+// 意图标签
+.intent-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  margin-left: 12px;
+
+  &.intent-general_qa { background: #f1f5f9; color: #64748b; }
+  &.intent-knowledge_qa { background: #eff6ff; color: #2563eb; }
+  &.intent-ops_query { background: #ecfdf5; color: #059669; }
+  &.intent-fault_analysis { background: #fffbeb; color: #b45309; }
+  &.intent-high_risk { background: #fef2f2; color: #dc2626; }
+  &.intent-prompt_injection { background: #fef2f2; color: #991b1b; }
+}
+
+.injection-warning-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 700;
+  margin-left: 8px;
+  background: #fef2f2;
+  color: #dc2626;
+  border: 1px solid #fecaca;
+  animation: pulse-warning 2s infinite;
+}
+
+@keyframes pulse-warning {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
 }
 </style>

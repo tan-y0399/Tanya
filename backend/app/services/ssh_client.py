@@ -6,6 +6,7 @@ SSH 客户端 —— 管理 Windows ↔ 麒麟VM 的通信通道。
 """
 
 import os
+import socket
 import paramiko
 import logging
 from typing import Optional, Tuple
@@ -14,6 +15,9 @@ logger = logging.getLogger(__name__)
 
 
 from app.core.config import settings as _settings
+
+# 最大重试次数
+MAX_RETRIES = 2
 
 
 class SSHClient:
@@ -42,7 +46,7 @@ class SSHClient:
         return self._client
 
     def connect(self) -> None:
-        """建立 SSH 连接。"""
+        """建立 SSH 连接，启用 keepalive 防止空闲断开。"""
         self._client = paramiko.SSHClient()
         self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
@@ -55,18 +59,42 @@ class SSHClient:
                 pkey=key,
                 timeout=self.timeout,
             )
+            transport = self._client.get_transport()
+            if transport:
+                transport.set_keepalive(30)
             logger.info(f"SSH connected to {self.host}")
         except Exception as e:
             logger.error(f"SSH connect failed: {e}")
             raise
 
-    def execute(self, command: str):  # type: (...) -> Tuple[str, str, int]
-        """执行远程命令，返回 (stdout, stderr, exit_code)。"""
-        stdin, stdout, stderr = self.client.exec_command(command, timeout=self.timeout)
-        exit_code = stdout.channel.recv_exit_status()
-        out = stdout.read().decode("utf-8", errors="replace").strip()
-        err = stderr.read().decode("utf-8", errors="replace").strip()
-        return out, err, exit_code
+    def execute(self, command: str, retry: bool = True):  # type: (...) -> Tuple[str, str, int]
+        """执行远程命令，返回 (stdout, stderr, exit_code)。自动重试僵尸连接。"""
+        last_error = None
+        for attempt in range(MAX_RETRIES if retry else 1):
+            try:
+                stdin, stdout, stderr = self.client.exec_command(command, timeout=self.timeout)
+                exit_code = stdout.channel.recv_exit_status()
+                out = stdout.read().decode("utf-8", errors="replace").strip()
+                err = stderr.read().decode("utf-8", errors="replace").strip()
+                return out, err, exit_code
+            except (socket.error, EOFError, OSError) as e:
+                last_error = e
+                logger.warning(f"SSH execute attempt {attempt + 1} failed: {e}")
+                if attempt < MAX_RETRIES - 1:
+                    try:
+                        self.reconnect()
+                    except Exception:
+                        pass
+            except Exception as e:
+                last_error = e
+                logger.warning(f"SSH execute attempt {attempt + 1} failed (unexpected): {e}")
+                if attempt < MAX_RETRIES - 1:
+                    try:
+                        self.reconnect()
+                    except Exception:
+                        pass
+
+        raise last_error or RuntimeError("SSH execute failed after retries")
 
     def reconnect(self) -> None:
         """断开并重新连接。"""
@@ -76,15 +104,25 @@ class SSHClient:
     def close(self) -> None:
         """关闭 SSH 连接。"""
         if self._client:
-            self._client.close()
+            try:
+                self._client.close()
+            except Exception:
+                pass
             self._client = None
 
     def is_alive(self) -> bool:
-        """检查连接是否存活。"""
+        """检查连接是否存活（发送实际探测而非仅检查 transport 标志）。"""
         if self._client is None:
             return False
         transport = self._client.get_transport()
-        return transport is not None and transport.is_active()
+        if transport is None or not transport.is_active():
+            return False
+        try:
+            # 发送实际探测，避免僵尸连接
+            transport.send_ignore()
+            return True
+        except Exception:
+            return False
 
 
 # ── SSH 连接池（多机集群管理）──

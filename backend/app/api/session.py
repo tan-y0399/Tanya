@@ -3,8 +3,7 @@ from datetime import datetime
 from fastapi import APIRouter
 
 from app.core.database import SessionLocal
-from app.models.message import Message
-from app.models.session import Session
+from app.models.session import Message, Session
 from app.schemas.session import (
     MessageItem,
     MessageListResponse,

@@ -56,3 +56,28 @@ async def get_current_user(
             pass
 
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户不存在或Token无效")
+
+
+async def get_current_user_optional(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+) -> Optional[dict]:
+    """可选认证：有token则返回用户，无token则返回None（不抛异常）"""
+    if not credentials:
+        return None
+    payload = decode_token(credentials.credentials)
+    if not payload:
+        return None
+    user_id = payload.get("sub")
+    if user_id:
+        from app.core.database import async_session
+        from sqlalchemy import select
+        from app.models.user import User
+        try:
+            async with async_session() as db:
+                result = await db.execute(select(User).where(User.id == user_id))
+                user = result.scalar_one_or_none()
+                if user:
+                    return {"id": user.id, "username": user.username, "role": user.role}
+        except Exception:
+            pass
+    return None

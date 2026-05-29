@@ -3,6 +3,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.config import settings
 from app.core.command_security import analyze_command, get_risk_level_info, RiskLevel
 from app.core.trace import generate_trace_id
 from app.models.approval import Approval
@@ -32,7 +33,7 @@ class WorkflowResult:
         self.approval_id: Optional[str] = None
         self.blocked: bool = False
         self.trace_id: str = generate_trace_id()
-    
+
     def to_dict(self):
         return {
             "success": self.success,
@@ -48,39 +49,94 @@ class WorkflowResult:
         }
 
 
+# ── 扩展的注入检测模式（含严重级别）──
+INJECTION_PATTERNS = [
+    # critical — 明确越狱/规则覆盖
+    (re.compile(r"(?i)ignore\s+(previous|prior|above|all|earlier)\s+(instructions?|rules?|directives?|commands?)"), "critical"),
+    (re.compile(r"(?i)forget\s+(everything|all|your)\s+(previous|prior|training|rules?)"), "critical"),
+    (re.compile(r"(?i)(new|overwrite|replace)\s+(instructions?|directives?|rules?)"), "critical"),
+    # high — 系统提示词提取/角色劫持
+    (re.compile(r"(?i)(system\s*prompt|your\s*prompt)\s*(is|:|=|now|should\s*be)"), "high"),
+    (re.compile(r"(?i)(display|show|print|reveal|dump)\s*(your\s*)?(system\s*)?(prompt|instructions?|rules?)"), "high"),
+    (re.compile(r"(?i)you\s+are\s+now\s+(a\s+)?(different|new|another)"), "high"),
+    (re.compile(r"(?i)do\s+(exactly|everything)\s+(I|the\s+user)\s+(say|tell\s+you|command)"), "high"),
+    (re.compile(r"(?i)(pretend|imagine)\s+(you\s+are|to\s+be)"), "high"),
+    # medium — 尝试绕过/混淆
+    (re.compile(r"(?i)act\s+as\s+(if\s+you\s+are|a\s+different)"), "medium"),
+    (re.compile(r"(?i)from\s+now\s+on\s+(you\s+are|your\s+name\s+is)"), "medium"),
+    (re.compile(r"(?i)disregard\s+(previous|prior|above|all|earlier|existing)\s+"), "medium"),
+    (re.compile(r"(?i)bypass\s*(security|check|filter|guard)"), "medium"),
+    (re.compile(r"(?i)execute\s+(without|bypass|skip)\s*(check|approval|security)"), "medium"),
+    # low — 危险的系统命令直接嵌入
+    (re.compile(r"(?i)rm\s+-rf\s*\/"), "low"),
+    (re.compile(r"(?i)format\s*(disk|partition)"), "low"),
+    (re.compile(r"(?i)shutdown\s+-h\s+now"), "low"),
+    (re.compile(r"(?i)reboot\s+-f"), "low"),
+    (re.compile(r"(?i)mkfs\."), "low"),
+]
+
+# URL 和外部内容注入检测
+EXTERNAL_CONTENT_PATTERNS = [
+    (re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+'), "external_url"),
+    (re.compile(r'<script[^>]*>'), "xss"),
+    (re.compile(r'<iframe[^>]*>'), "xss"),
+    (re.compile(r'<img[^>]*onerror[^>]*>'), "xss"),
+    (re.compile(r'```[\s\S]*?```'), "code_block"),
+]
+
+
+def _detect_prompt_injection(user_input: str) -> dict:
+    """检测提示词注入，返回 {pass, reason, pattern, severity}"""
+    if not user_input or not user_input.strip():
+        return {"pass": True, "reason": "", "pattern": "", "severity": "none"}
+
+    for pattern, severity in INJECTION_PATTERNS:
+        match = pattern.search(user_input)
+        if match:
+            pattern_desc = pattern.pattern.replace("\\s*", " ")[:80]
+            return {
+                "pass": severity == "low",
+                "reason": f"检测到注入模式 [{severity}]: {pattern_desc}",
+                "pattern": pattern.pattern,
+                "severity": severity,
+            }
+    return {"pass": True, "reason": "", "pattern": "", "severity": "none"}
+
+
+def check_external_content(user_input: str) -> dict:
+    """扫描外部内容注入（URL/XSS/代码块）"""
+    findings = []
+    for pattern, content_type in EXTERNAL_CONTENT_PATTERNS:
+        matches = pattern.findall(user_input)
+        if matches:
+            findings.append({"type": content_type, "count": len(matches), "matches": matches[:3]})
+    return {
+        "has_external_content": len(findings) > 0,
+        "findings": findings,
+        "safe": len(findings) == 0,
+    }
+
+
 class SecurityWorkflow:
-    INJECTION_PATTERNS = [
-        r"(?i)ignore.*previous.*instructions?",
-        r"(?i)forget.*previous.*commands?",
-        r"(?i)you.*are.*not.*a.*language.*model",
-        r"(?i)bypass.*security",
-        r"(?i)execute.*without.*check",
-        r"(?i)run.*as.*root",
-        r"(?i)rm.*-rf.*\/",
-        r"(?i)format.*disk",
-        r"(?i)shutdown.*-h.*now",
-        r"(?i)reboot.*-f",
-    ]
-    
     def __init__(self, db: AsyncSession, user_id: str, session_id: str):
         self.db = db
         self.user_id = user_id
         self.session_id = session_id
         self.trace_id = generate_trace_id()
-    
+
     async def run(self, user_input: str) -> WorkflowResult:
         result = WorkflowResult()
         result.trace_id = self.trace_id
-        
+
         result.stage = WorkflowStage.PROMPT_INJECTION
-        injection_result = self._detect_prompt_injection(user_input)
+        injection_result = _detect_prompt_injection(user_input)
         if not injection_result["pass"]:
             result.success = False
             result.message = injection_result["reason"]
             result.blocked = True
             await self._record_audit(result, user_input, "blocked", "prompt_injection")
             return result
-        
+
         result.stage = WorkflowStage.INTENT_PARSING
         intent_result = self._parse_intent(user_input)
         if not intent_result["success"]:
@@ -89,31 +145,31 @@ class SecurityWorkflow:
             await self._record_audit(result, user_input, "failed", "intent_parsing")
             return result
         result.data["intent"] = intent_result
-        
+
         result.stage = WorkflowStage.ENV_AWARENESS
         env_result = await self._env_awareness()
         result.data["environment"] = env_result
-        
+
         result.stage = WorkflowStage.RISK_FILTER
         risk_result = await self._risk_filter(intent_result)
         result.risk_level = risk_result["risk_level"]
         result.require_approval = risk_result["require_approval"]
         result.require_confirm = risk_result["require_confirm"]
         result.blocked = risk_result.get("blocked", False)
-        
+
         if risk_result.get("blocked", False):
             result.success = False
             result.message = risk_result.get("block_message", "命令被阻止")
             await self._record_audit(result, user_input, "blocked", "risk_filter")
             return result
-        
+
         if result.require_approval:
             result.approval_id = await self._create_approval(intent_result)
             result.success = False
             result.message = "需要审批"
             await self._record_audit(result, user_input, "pending_approval", "risk_filter")
             return result
-        
+
         result.stage = WorkflowStage.PERMISSION_CHECK
         permission_result = await self._permission_check(intent_result)
         if not permission_result["allowed"]:
@@ -121,28 +177,22 @@ class SecurityWorkflow:
             result.message = permission_result["reason"]
             await self._record_audit(result, user_input, "denied", "permission_check")
             return result
-        
+
         result.stage = WorkflowStage.EXECUTION
         execution_result = await self._execute(intent_result)
         result.success = execution_result["success"]
         result.message = execution_result.get("message", "")
         result.data["execution"] = execution_result
-        
+
         await self._record_audit(result, user_input, "completed", "execution")
-        
+
         return result
-    
-    def _detect_prompt_injection(self, user_input: str) -> Dict:
-        for pattern in self.INJECTION_PATTERNS:
-            if re.search(pattern, user_input):
-                return {"pass": False, "reason": f"检测到恶意注入模式: {pattern}"}
-        return {"pass": True, "reason": "通过检测"}
-    
+
     def _parse_intent(self, user_input: str) -> Dict:
         parts = user_input.strip().split("\n")
         command = ""
         comment = ""
-        
+
         for part in parts:
             if part.strip().startswith(("!", "$", ">")):
                 command = part.strip().lstrip("!$> ").strip()
@@ -152,21 +202,21 @@ class SecurityWorkflow:
                     command = match.group(1).strip()
             elif command:
                 comment += part + "\n"
-        
+
         if not command:
             if re.match(r"^\s*[a-zA-Z][a-zA-Z0-9_-]*\s", user_input):
                 command = user_input.strip()
-        
+
         if not command:
             return {"success": False, "error": "未识别到命令"}
-        
+
         return {
             "success": True,
             "command": command,
             "comment": comment.strip(),
             "type": "command_execution",
         }
-    
+
     async def _env_awareness(self) -> Dict:
         try:
             sys_info = execute_tool("get_system_info")
@@ -180,11 +230,11 @@ class SecurityWorkflow:
             }
         except Exception as e:
             return {"error": str(e), "timestamp": datetime.utcnow().isoformat()}
-    
+
     async def _risk_filter(self, intent: Dict) -> Dict:
         command = intent.get("command", "")
         analysis = analyze_command(command)
-        
+
         if not analysis["success"]:
             return {
                 "risk_level": RiskLevel.MEDIUM.value,
@@ -193,9 +243,9 @@ class SecurityWorkflow:
                 "blocked": False,
                 "reason": analysis.get("error", "命令分析失败"),
             }
-        
+
         risk_info = get_risk_level_info(analysis["risk_level"])
-        
+
         return {
             "risk_level": analysis["risk_level"],
             "require_approval": analysis["require_approval"],
@@ -207,40 +257,39 @@ class SecurityWorkflow:
             "reason": analysis.get("reason", risk_info["description"]),
             "analysis": analysis,
         }
-    
+
     async def _permission_check(self, intent: Dict) -> Dict:
         command = intent.get("command", "")
         analysis = analyze_command(command)
-        
+
         if analysis.get("blocked", False):
             return {"allowed": False, "reason": analysis.get("block_message", "命令被阻止")}
-        
-        user_result = await self.db.execute(
-            "SELECT role FROM users WHERE id = :user_id", {"user_id": self.user_id}
-        )
-        user = user_result.fetchone()
+
+        from sqlalchemy import select
+        from app.models.user import User
+
+        result = await self.db.execute(select(User).where(User.id == self.user_id))
+        user = result.scalar_one_or_none()
         if not user:
             return {"allowed": False, "reason": "用户不存在"}
-        
-        role = user[0]
-        
+
+        role = user.role
         risk_level = analysis.get("risk_level", RiskLevel.SAFE.value)
-        
+
         if role == "admin":
             return {"allowed": True, "reason": "管理员权限"}
-        
+
         if role == "auditor":
             if risk_level in [RiskLevel.SAFE.value, RiskLevel.LOW.value]:
                 return {"allowed": True, "reason": "审计员权限允许"}
-            else:
-                return {"allowed": False, "reason": "审计员权限不足"}
-        
+            return {"allowed": False, "reason": "审计员权限不足"}
+
         return {"allowed": False, "reason": "未知角色"}
-    
+
     async def _create_approval(self, intent: Dict) -> str:
         analysis = analyze_command(intent.get("command", ""))
         expires_at = datetime.utcnow() + timedelta(minutes=settings.approval_timeout)
-        
+
         approval = Approval(
             trace_id=self.trace_id,
             session_id=self.session_id,
@@ -254,19 +303,19 @@ class SecurityWorkflow:
             requested_by=self.user_id,
             expires_at=expires_at,
         )
-        
+
         self.db.add(approval)
         await self.db.commit()
         await self.db.refresh(approval)
-        
+
         return approval.id
-    
+
     async def _execute(self, intent: Dict) -> Dict:
         command = intent.get("command", "")
-        
+
         try:
             result = execute_tool("run_command", command=command, timeout=30)
-            
+
             if result.get("success", False):
                 return {
                     "success": True,
@@ -288,7 +337,7 @@ class SecurityWorkflow:
                 "error": str(e),
                 "message": f"命令执行异常: {str(e)}",
             }
-    
+
     async def _record_audit(self, result: WorkflowResult, user_input: str, status: str, stage: str):
         try:
             audit = AuditRecord(
@@ -313,6 +362,3 @@ class SecurityWorkflow:
             await self.db.commit()
         except Exception:
             pass
-
-
-from app.core.config import settings

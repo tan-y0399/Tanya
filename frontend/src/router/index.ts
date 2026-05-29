@@ -1,4 +1,5 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
+import { useUserStore } from '@/stores/user'
 
 const router = createRouter({
   history: createWebHashHistory(),
@@ -10,10 +11,42 @@ const router = createRouter({
       meta: { title: '登录' },
     },
     {
+      path: '/register',
+      name: 'Register',
+      component: () => import('@/views/RegisterView.vue'),
+      meta: { title: '注册' },
+    },
+    {
       path: '/',
       component: () => import('@/components/layout/AppLayout.vue'),
-      redirect: '/dashboard',
+      redirect: '/chat',
       children: [
+        // 管理员工作台
+        {
+          path: 'admin',
+          name: 'Admin',
+          component: () => import('@/views/admin/AdminPage.vue'),
+          meta: { title: '管理员工作台', role: 'admin' },
+        },
+        // 管理员反馈管理
+        {
+          path: 'admin/feedback',
+          name: 'AdminFeedback',
+          component: () => import('@/views/admin/FeedbackPage.vue'),
+          meta: { title: '反馈管理', role: 'admin' },
+        },
+        // 兼容旧路由 /user → /chat
+        {
+          path: 'user',
+          redirect: '/chat',
+        },
+        // 用户反馈
+        {
+          path: 'user/feedback',
+          name: 'UserFeedback',
+          component: () => import('@/views/user/FeedbackPage.vue'),
+          meta: { title: '反馈' },
+        },
         {
           path: 'dashboard',
           name: 'Dashboard',
@@ -73,16 +106,34 @@ const router = createRouter({
   ],
 })
 
-// 简单鉴权守卫
+// 鉴权守卫 + 角色守卫
 router.beforeEach((to, _from, next) => {
-  const token = localStorage.getItem('token')
+  const userStore = useUserStore()
+  const token = userStore.token
+
   if (to.name !== 'Login' && !token) {
     next({ name: 'Login' })
-  } else if (to.name === 'Login' && token) {
-    next({ name: 'Dashboard' })
-  } else {
-    next()
+    return
   }
+
+  if (to.name === 'Login' && token) {
+    // 已登录用户根据角色跳转
+    const role = userStore.userInfo?.role || 'user'
+    next({ name: role === 'admin' ? 'Knowledge' : 'Chat' })
+    return
+  }
+
+  // 角色路由守卫
+  if (to.meta.role) {
+    const role = userStore.userInfo?.role || 'user'
+    if (to.meta.role !== role) {
+      // 角色不匹配，跳转到对应角色的默认页面
+      next({ name: role === 'admin' ? 'Knowledge' : 'Chat' })
+      return
+    }
+  }
+
+  next()
 })
 
 export default router

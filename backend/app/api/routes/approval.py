@@ -1,89 +1,111 @@
-import json
-from fastapi import APIRouter, Depends, HTTPException, Body
+"""
+审批管理 API — 完整实现待审批列表、历史、通过/拒绝
+"""
+
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.core.database import get_db
-from app.core.security import get_current_user
-from app.services import approval_service
+from app.core.security import get_current_user_optional, get_current_user
+from app.services.approval_service import (
+    get_pending,
+    get_history,
+    approve,
+    reject,
+    get_stats,
+)
+from app.schemas.approval import ApproveRequest, RejectRequest
 
-router = APIRouter(prefix="/approval", tags=["审批"])
-
-
-@router.get("/pending")
-async def pending_list(user: dict = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    data = await approval_service.get_pending(db)
-    return {"code": 0, "data": data}
-
-
-@router.get("/history")
-async def history_list(page: int = 1, size: int = 20,
-                       user: dict = Depends(get_current_user),
-                       db: AsyncSession = Depends(get_db)):
-    data = await approval_service.get_history(db, page, size)
-    return {"code": 0, "data": data}
+router = APIRouter(tags=['approval'])
 
 
-@router.post("/{approval_id}/approve")
-async def do_approve(approval_id: str, req: dict = Body(default={}),
-                     user: dict = Depends(get_current_user),
-                     db: AsyncSession = Depends(get_db)):
-    comment = req.get("comment", "")
-    result = await approval_service.approve(db, approval_id, user["username"], comment)
-    if not result:
-        raise HTTPException(status_code=404, detail="审批单不存在或已处理")
-    # 实际执行由前端通过 /chat/send (pendingApprovalId) 恢复 ReAct 循环完成
-    return {"code": 0, "message": "审批通过", "approvalId": approval_id}
+@router.get('/approval/pending')
+async def list_pending_approvals(db: AsyncSession = Depends(get_db), _=Depends(get_current_user_optional)):
+    """获取待审批操作列表（自动清理过期项）"""
+    result = await get_pending(db)
+    return {"code": 0, "data": result}
 
 
-@router.post("/{approval_id}/reject")
-async def do_reject(approval_id: str, req: dict = Body(default={}),
-                    user: dict = Depends(get_current_user),
-                    db: AsyncSession = Depends(get_db)):
-    reason = req.get("reason", "")
-    result = await approval_service.reject(db, approval_id, user["username"], reason)
-    if not result:
-        raise HTTPException(status_code=404, detail="审批单不存在或已处理")
-    return {"code": 0, "message": "审批拒绝"}
+@router.get('/approval/history')
+async def list_approval_history(page: int = 1, size: int = 20, db: AsyncSession = Depends(get_db),
+                                _=Depends(get_current_user_optional)):
+    """获取审批历史记录"""
+    result = await get_history(db, page=page, size=size)
+    return {"code": 0, "data": result}
 
 
-@router.post("/execute")
-async def execute_with_approval(req: dict = Body(...),
-                                user: dict = Depends(get_current_user),
-                                db: AsyncSession = Depends(get_db)):
-    command = req.get("command", "")
-    session_id = req.get("sessionId", "")
-    
-    if not command:
-        raise HTTPException(status_code=400, detail="命令不能为空")
-    
-    from app.core.command_security import analyze_command, get_risk_level_info
-    
-    analysis = analyze_command(command)
-    if not analysis["success"]:
-        raise HTTPException(status_code=400, detail=analysis.get("error", "命令分析失败"))
-    
-    if analysis.get("blocked", False):
-        raise HTTPException(status_code=403, detail=analysis.get("block_message", "命令被阻止"))
-    
-    if not analysis.get("require_approval", False):
-        result = execute_tool("run_command", command=command, timeout=30)
-        return {"code": 0, "message": "命令已执行", "result": result, "riskLevel": analysis["risk_level"]}
-    
-    approval = await approval_service.create_approval(
-        db,
-        trace_id="",
-        session_id=session_id,
-        tool_name="execute_command",
-        tool_params_json=json.dumps({"command": command}),
-        risk_level=analysis["risk_level"],
-        detail=f"执行命令: {command}",
-        requested_by=user["id"],
+@router.get('/approval/stats')
+async def approval_statistics(db: AsyncSession = Depends(get_db), _=Depends(get_current_user_optional)):
+    """获取审批统计数据"""
+    result = await get_stats(db)
+    return {"code": 0, "data": result}
+
+
+@router.post('/approval/{approval_id}/approve')
+async def approve_operation(
+    approval_id: str,
+    payload: ApproveRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """管理员审批通过 — 仅标记审批状态，工具执行由用户端恢复时触发"""
+    approval = await approve(db, approval_id, approver=current_user["username"], comment=payload.comment)
+    if not approval:
+        raise HTTPException(status_code=404, detail="审批不存在、已处理或已过期")
+
+    # 更新 PendingExecution 状态，但不执行工具（由用户端 resume 触发）
+    from app.models.pending_execution import PendingExecution
+    from sqlalchemy import select
+    result = await db.execute(
+        select(PendingExecution).where(
+            PendingExecution.approval_id == approval_id,
+            PendingExecution.status == "pending",
+        )
     )
-    
-    risk_info = get_risk_level_info(analysis["risk_level"])
+    pe = result.scalar_one_or_none()
+    if pe:
+        pe.status = "approved"
+        await db.commit()
+
     return {
         "code": 0,
-        "message": f"命令需要审批 ({risk_info['name']})",
-        "approvalId": approval.id,
-        "riskLevel": analysis["risk_level"],
-        "riskInfo": risk_info,
+        "data": {
+            "approved": True,
+            "message": "已批准，等待用户端恢复执行",
+        },
+    }
+
+
+@router.post('/approval/{approval_id}/reject')
+async def reject_operation(
+    approval_id: str,
+    payload: RejectRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """管理员拒绝审批"""
+    approval = await reject(db, approval_id, approver=current_user["username"], reason=payload.reason)
+    if not approval:
+        raise HTTPException(status_code=404, detail="审批不存在、已处理或已过期")
+
+    # 更新 PendingExecution 状态为已拒绝
+    from app.models.pending_execution import PendingExecution
+    from sqlalchemy import select
+    result = await db.execute(
+        select(PendingExecution).where(
+            PendingExecution.approval_id == approval_id,
+            PendingExecution.status == "pending",
+        )
+    )
+    pe = result.scalar_one_or_none()
+    if pe:
+        pe.status = "rejected"
+        await db.commit()
+
+    return {
+        "code": 0,
+        "data": {
+            "approved": False,
+            "message": "已拒绝：{}".format(payload.reason or '不予执行'),
+        },
     }

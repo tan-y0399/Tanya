@@ -1,4 +1,6 @@
+import asyncio
 import json
+import logging
 from datetime import datetime, timedelta
 import httpx
 from typing import Optional, List, Dict, Any
@@ -11,394 +13,34 @@ from app.models.pending_execution import PendingExecution
 from app.core.config import settings
 from app.core.trace import generate_trace_id
 from app.core.command_security import analyze_command, RiskLevel, get_risk_level_info
+from app.services.tool_definitions import TOOLS, SYSTEM_PROMPT
+from app.services.intent_router import intent_router, IntentType
+from app.services.performance_telemetry import TraceTelemetry, record_trace
+from app.services.security_workflow import _detect_prompt_injection  # 保留兼容
 
-
-# ============================================================
-# 工具定义 (OpenAI Function Calling 格式)
-# ============================================================
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_system_info",
-            "description": "获取系统概览信息，包括CPU、内存、磁盘、系统版本等",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_disk_usage",
-            "description": "查询磁盘挂载和使用情况",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mount_point": {"type": "string", "description": "指定挂载点路径，留空查询全部"},
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_cpu_info",
-            "description": "获取CPU使用率、核心数、负载等信息",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_memory_info",
-            "description": "获取内存和交换区使用情况",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_processes",
-            "description": "获取进程列表，可按CPU或内存排序",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "sort_by": {"type": "string", "enum": ["cpu", "mem"], "description": "排序字段"},
-                    "limit": {"type": "integer", "description": "返回数量，默认10"},
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_process_detail",
-            "description": "获取指定进程的详细信息",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pid": {"type": "integer", "description": "进程ID"},
-                },
-                "required": ["pid"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "kill_process",
-            "description": "终止指定进程，默认发送TERM信号",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pid": {"type": "integer", "description": "进程ID"},
-                    "signal": {"type": "string", "description": "信号类型，如TERM、KILL，默认TERM"},
-                },
-                "required": ["pid"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_network_connections",
-            "description": "查询网络连接状态和监听端口",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "state": {"type": "string", "description": "连接状态过滤: LISTEN, ESTABLISHED 等"},
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_service_status",
-            "description": "获取指定系统服务的状态",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "service_name": {"type": "string", "description": "服务名称"},
-                },
-                "required": ["service_name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "manage_service",
-            "description": "管理系统服务：启动、停止、重启、重载",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "service_name": {"type": "string", "description": "服务名称"},
-                    "action": {"type": "string", "enum": ["start", "stop", "restart", "reload"], "description": "操作类型"},
-                },
-                "required": ["service_name", "action"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_file_list",
-            "description": "获取指定目录的文件列表",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "目录路径，默认为当前目录"},
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "读取指定文件的内容",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": "文件路径"},
-                },
-                "required": ["file_path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_journal_logs",
-            "description": "搜索系统日志",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "service": {"type": "string", "description": "服务名过滤，如 nginx, mysql"},
-                    "priority": {"type": "string", "enum": ["err", "warning", "info"], "description": "日志级别"},
-                    "lines": {"type": "integer", "description": "返回行数，默认20"},
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_users",
-            "description": "获取系统用户列表",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_groups",
-            "description": "获取系统用户组列表",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "execute_command",
-            "description": "在远程系统上执行shell命令。⚠ 高危操作，需经过安全检查",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "要执行的shell命令"},
-                    "timeout": {"type": "integer", "description": "命令超时秒数，默认30"},
-                },
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "summarize_task",
-            "description": "总结当前任务，结束对话，提供最终报告",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "summary": {"type": "string", "description": "任务总结内容"},
-                },
-                "required": [],
-            },
-        },
-    },
-]
-
-SYSTEM_PROMPT = """你是 KylinOps 智能运维 Agent，运行在麒麟操作系统 V11 上。你是一个智能的、主动的运维助手。
-
-## 核心能力
-- 自动理解用户意图，不需要用户明确说"执行命令"或"调用工具"
-- 能够规划多步骤任务并自动执行所有必要步骤
-- 像人类助手一样自然对话，主动提供建议和方案
-
-## 任务处理流程（自动执行）
-1. **理解意图**：自动分析用户的自然语言请求
-2. **规划步骤**：自动规划完成任务所需的步骤
-3. **自动执行**：按步骤自动调用工具获取信息和执行操作
-4. **智能判断**：根据结果决定下一步（继续/确认/完成）
-5. **总结报告**：完成任务后提供详细总结
-
-## 智能决策规则
-- 如果用户说"查看磁盘" -> 直接调用 get_disk_usage 获取磁盘信息并展示
-- 如果用户说"磁盘满了，清理一下" -> 先查看磁盘 -> 使用标准路径分析大文件 -> 列出可删除项 -> 等待确认 -> 执行删除
-- 如果用户说"检查nginx服务" -> 先查看服务状态 -> 如果异常则建议重启 -> 等待确认后执行
-- 如果用户说"系统慢" -> 自动检查CPU、内存、进程 -> 分析瓶颈 -> 提供优化建议
-
-## 磁盘清理标准路径
-清理磁盘时，请使用以下标准路径列表，不要使用其他路径：
-- 低风险（可自动清理）：/var/log, /var/cache, /var/tmp, /tmp
-- 高风险（需确认）：/home, /root, /var/lib/docker
-
-检查磁盘空间使用命令示例：du -sh /var/log /var/cache /var/tmp /tmp /home /root 2>/dev/null | sort -rh
-
-## 对话状态管理
-- 记住对话历史，理解上下文
-- 如果用户问"然后呢？"或"继续"，继续执行下一步
-- 如果用户说"取消"或"算了"，中止当前任务
-
-## 安全规则（系统自动执行，LLM无需关心）
-系统内置多层安全护栏，对你每次工具调用自动进行风险分级：
-- 🟢 L1 只读操作（get_cpu_info, get_memory_info, get_disk_usage, list_processes, get_service_status,
-  get_network_connections, get_file_list, read_file, get_logs, get_users, get_groups 等）：
-  自动执行，无需确认
-- 🟡 L2 低风险操作（kill TERM信号, manage_service start, 查询类命令）：自动向用户确认后执行
-- 🟠 L3 高风险操作（kill -9/KILL, manage_service stop/restart, rm/chmod/iptables等）：
-  需要用户审批
-- 🔴 L4~L5 致命操作（mkfs, fdisk, useradd, passwd, yum install/remove 等）：
-  需要审批，部分命令（mkfs/fdisk）直接被阻止
-
-你只需要正常调用工具即可，安全护栏会自动拦截、审批或放行。对于被阻止的操作，你会收到 error 消息。
-
-## 可用工具
-| 工具名 | 用途 | 风险级别 |
-|--------|------|----------|
-| get_system_info | 获取系统概览 | L1 |
-| get_cpu_info | 获取CPU信息 | L1 |
-| get_memory_info | 获取内存信息 | L1 |
-| get_disk_usage | 获取磁盘使用 | L1 |
-| list_processes | 进程列表 | L1 |
-| get_process_detail | 进程详情 | L1 |
-| kill_process | 终止进程 | L2~L3 |
-| get_service_status | 服务状态 | L1 |
-| manage_service | 服务管理(启动/停止/重启) | L2~L4 |
-| get_network_connections | 网络连接 | L1 |
-| get_network_interfaces | 网络接口 | L1 |
-| get_file_list | 文件列表 | L1 |
-| read_file | 读取文件 | L1 |
-| get_logs | 系统日志 | L1 |
-| get_users | 用户列表 | L1 |
-| get_groups | 用户组列表 | L1 |
-| execute_command | 执行任意命令 | 按命令风险分级 |
-| summarize_task | 总结任务并结束 | L1 |
-
-## 输出格式规范（严格遵守）
-你必须使用 Markdown 格式化输出，让结果清晰美观。按数据类型使用以下格式：
-
-### 数值指标（CPU、内存、磁盘使用率等）
-使用 **表格** 展示，重要指标用 `**粗体**` 高亮：
-
-```
-| 指标 | 数值 | 状态 |
-|------|------|------|
-| CPU使用率 | **23.5%** | 🟢 正常 |
-| 内存使用率 | **78.2%** | 🟡 偏高 |
-| 磁盘 /dev/sda1 | **45%** | 🟢 正常 |
-```
-
-### 系统概览
-使用 **卡片式标题 + 表格**：
-
-```
-### 🖥 系统概览
-| 项目 | 详情 |
-|------|------|
-| 操作系统 | Kylin Linux V11 |
-| 内核版本 | 5.10.0-8-generic |
-| 运行时间 | 3 days 12 hours |
-| 主机名 | kylin-server-01 |
-```
-
-### 进程列表
-使用 **表格**，高亮资源占用高的进程：
-
-```
-### 📋 进程列表 (TOP 5)
-| PID | 进程名 | CPU% | MEM% | 用户 |
-|-----|--------|------|------|------|
-| 1234 | **mysqld** | **45.2%** | 12.1% | mysql |
-| 5678 | nginx | 2.3% | 1.5% | www |
-```
-
-### 多步骤任务
-使用 **步骤列表**，每步标注状态：
-
-```
-### 🔍 磁盘空间分析
-
-**Step 1**: 检查磁盘使用 ✅
-| 分区 | 总量 | 已用 | 可用 | 使用率 |
-|------|------|------|------|--------|
-| /dev/sda1 | 100G | 45G | 55G | 45% |
-
-**Step 2**: 分析大文件目录 ✅
-- `/var/log` — 12G（可清理）
-- `/tmp` — 3.2G（可清理）
-
-**Step 3**: 建议操作 🟡
-建议清理以上目录，预计释放 **15.2G** 空间。是否继续？
-```
-
-### 日志/错误信息
-使用 **代码块**：
-
-~~~
-### ⚠️ 错误日志 (最近5条)
-\`\`\`
-May 21 10:30:15 kylin nginx[1234]: connect() failed
-May 21 10:30:16 kylin nginx[1234]: upstream timeout
-\`\`\`
-~~~
-
-### 健康评分
-巡检完成后给出总体评分：
-
-```
-### 🏥 系统健康评分: 85/100 🟡
-| 维度 | 分数 | 状态 |
-|------|------|------|
-| CPU | 90/100 | 🟢 |
-| 内存 | 75/100 | 🟡 |
-| 磁盘 | 85/100 | 🟢 |
-| 网络 | 90/100 | 🟢 |
-```
-
-## 输出要求
-- 始终使用 Markdown 表格、标题、列表、代码块格式化输出
-- 数值数据用表格，不要用纯文本罗列
-- 关键指标用 `**粗体**`，状态用 🟢🟡🔴 标识
-- 多步骤任务用步骤编号 + 状态标记
-- 短语优先，避免冗长段落
-- 中文回复，专业友好
-"""
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
 # 工具执行器 —— 通过 SSH 在远程麒麟VM上真实执行
 # ============================================================
 def execute_tool(name: str, args: dict) -> dict:
-    """执行工具调用，转发到远程麒麟VM执行"""
+    """执行工具调用，通过 MCP 协议转发到远程麒麟VM执行。
+
+    两层调度:
+      1. MCP adapter — 标准化协议 + 安全校验 + 审计
+      2. remote_executor — SSH 转发 + 沙箱执行
+    """
     from app.services.remote_executor import execute_tool as remote_exec
 
-    # 工具名映射：chat_service 中的工具名 → remote_executor 中的工具名
+    # ── 通过 MCP registry 查找工具定义 ──
+    try:
+        from app.mcp.registry import get_tool_definition, call_tool
+        mcp_def = get_tool_definition(name)
+    except Exception:
+        mcp_def = None
+
+    # 工具名映射：chat_service 标准名 → remote_executor 内部名
     tool_map = {
         "get_system_info": "get_system_info",
         "get_cpu_info": "get_cpu_info",
@@ -417,6 +59,19 @@ def execute_tool(name: str, args: dict) -> dict:
         "get_groups": "get_groups",
     }
 
+    # ── 优先通过 MCP protocol 调用 ──
+    if mcp_def:
+        try:
+            mcp_result = call_tool(name, args)
+            # MCP registry 可能返回了结果，也可能没有找到对应实现
+            if mcp_result and not isinstance(mcp_result, dict) and mcp_result.get("_not_found"):
+                pass  # fall through to remote_exec
+            elif mcp_result:
+                return mcp_result
+        except Exception:
+            pass  # MCP 调用失败则回退到远程执行
+
+    # ── 回退：直接调用远程执行器 ──
     if name in tool_map:
         return remote_exec(tool_map[name], **args)
 
@@ -426,11 +81,11 @@ def execute_tool(name: str, args: dict) -> dict:
         lines = args.get("lines", 20)
         cmd = "journalctl"
         if service:
-            cmd += f" -u {service}"
+            cmd += " -u " + service
         if priority:
             prio_map = {"err": "3", "warning": "4", "info": "6"}
-            cmd += f" -p {prio_map.get(priority, '6')}"
-        cmd += f" -n {lines} --no-pager 2>/dev/null"
+            cmd += " -p " + prio_map.get(priority, "6")
+        cmd += " -n " + str(lines) + " --no-pager 2>/dev/null"
         return remote_exec("run_command", command=cmd, timeout=5)
 
     if name == "execute_command":
@@ -448,7 +103,7 @@ def execute_tool(name: str, args: dict) -> dict:
             }
         }
 
-    return {"success": False, "error": f"未知工具: {name}"}
+    return {"success": False, "error": "未知工具: " + name}
 
 
 def get_tool_risk_level(name: str, args: dict = None) -> str:
@@ -509,10 +164,11 @@ def _check_tool_safety(tool_name: str, tool_args: dict) -> dict:
       {safe, blocked, block_message, require_approval, require_confirm, risk_level}
 
     分级规则（严格按照产品规范）:
-      L1 🟢: 只读操作，直接执行
-      L2 🟡: 需确认（kill -9 升级为审批）
-      L3 🟠: 需审批
-      L4~L5 🔴: 需审批，部分命令直接阻止
+      L1 🟢: 安全操作，直接执行
+      L2 🟡: 低风险，用户确认后执行
+      L3 🟠: 中等风险，需管理员审批
+      L4 🟠→🔴: 高风险，需管理员审批
+      L5 🔴: 致命风险，需管理员审批/禁止
     """
     risk = get_tool_risk_level(tool_name, tool_args)
 
@@ -561,7 +217,14 @@ def _check_tool_safety(tool_name: str, tool_args: dict) -> dict:
             return result
 
         # 命令分析通过，按工具级别处理
-        if risk in ("L3", "L4", "L5"):
+        # L3: 中等风险，需管理员审批
+        if risk == "L3":
+            result["safe"] = False
+            result["require_approval"] = True
+            result["require_confirm"] = True
+            return result
+        # L4/L5: 必须管理员审批
+        if risk in ("L4", "L5"):
             result["safe"] = False
             result["require_approval"] = True
             result["require_confirm"] = True
@@ -572,21 +235,21 @@ def _check_tool_safety(tool_name: str, tool_args: dict) -> dict:
             return result
         return result
 
-    # kill_process: TERM=L2需确认, KILL=L3需审批
+    # kill_process: TERM=L2需确认, KILL=L4需审批
     if tool_name == "kill_process":
         signal = tool_args.get("signal", "").upper()
         if signal in ("KILL", "9"):
             result["safe"] = False
             result["require_approval"] = True
             result["require_confirm"] = True
-            result["risk_level"] = "L3"
+            result["risk_level"] = "L4"
             return result
         result["safe"] = False
         result["require_confirm"] = True
         result["risk_level"] = "L2"
         return result
 
-    # manage_service: start=L2需确认, stop/restart/reload=L3需审批
+    # manage_service: start=L2需确认, stop/restart/reload=L4需审批
     if tool_name == "manage_service":
         action = tool_args.get("action", "").lower()
         if action in ("stop", "restart", "reload"):
@@ -606,8 +269,15 @@ def _check_tool_safety(tool_name: str, tool_args: dict) -> dict:
         result["require_confirm"] = True
         return result
 
-    # L3~L5: 需审批
-    if risk in ("L3", "L4", "L5"):
+    # L3: 中等风险，需管理员审批
+    if risk == "L3":
+        result["safe"] = False
+        result["require_approval"] = True
+        result["require_confirm"] = True
+        return result
+
+    # L4~L5: 必须管理员审批
+    if risk in ("L4", "L5"):
         result["safe"] = False
         result["require_approval"] = True
         result["require_confirm"] = True
@@ -756,7 +426,7 @@ async def save_message(db: AsyncSession, session_id: str, role: str, content: st
 # DeepSeek API 调用
 # ============================================================
 async def call_deepseek(messages: List[Dict], stream: bool = True):
-    """调用 DeepSeek API，返回流式响应或完整响应"""
+    """调用 DeepSeek API，带重试逻辑"""
     url = f"{settings.llm_api_base}/chat/completions"
     headers = {
         "Authorization": f"Bearer {settings.llm_api_key}",
@@ -772,35 +442,203 @@ async def call_deepseek(messages: List[Dict], stream: bool = True):
         "tool_choice": "auto",
     }
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        if stream:
-            async with client.stream("POST", url, headers=headers, json=payload) as resp:
-                async for line in resp.aiter_lines():
-                    if line.startswith("data: "):
-                        data_str = line[6:]
-                        if data_str == "[DONE]":
+    max_retries = 3
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                if stream:
+                    async with client.stream("POST", url, headers=headers, json=payload) as resp:
+                        if resp.status_code >= 400:
+                            body = await resp.aread()
+                            last_error = Exception(f"DeepSeek HTTP {resp.status_code}: {body.decode()[:200]}")
+                            if resp.status_code == 429:
+                                await asyncio.sleep(2 ** attempt)
+                                continue
                             break
-                        try:
-                            data = json.loads(data_str)
-                            yield data
-                        except Exception:
-                            continue
-        else:
-            resp = await client.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
-            yield resp.json()
+                        async for line in resp.aiter_lines():
+                            if line.startswith("data: "):
+                                data_str = line[6:]
+                                if data_str == "[DONE]":
+                                    return
+                                try:
+                                    data = json.loads(data_str)
+                                    yield data
+                                except Exception:
+                                    continue
+                        return
+                else:
+                    resp = await client.post(url, headers=headers, json=payload)
+                    resp.raise_for_status()
+                    yield resp.json()
+                    return
+        except httpx.HTTPStatusError as e:
+            last_error = e
+            if e.response.status_code == 429:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            break
+        except (httpx.ConnectError, httpx.TimeoutException) as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1.5 ** attempt)
+                continue
+            break
+
+    raise last_error or Exception("DeepSeek API call failed")
 
 
 # ============================================================
 # Agent 处理主流程 (ReAct 循环)
 # ============================================================
 async def process_message(db: AsyncSession, session_id: str, content: str, user_id: str):
-    """Agent 主处理流程 - SSE 流式推送"""
+    """Agent 主处理流程 - SSE 流式推送（使用意图路由架构）"""
     trace_id = generate_trace_id()
     assistant_msg_id = generate_id()
+    telemetry = TraceTelemetry(trace_id, session_id, user_id)
+
+    # 会话记忆
+    from app.services.session_memory import get_memory
+    memory = get_memory(session_id, user_id)
+    memory.total_messages += 1
 
     # 保存用户消息
     await save_message(db, session_id, "user", content, trace_id=trace_id)
+
+    try:
+        async for event in _process_message_impl(
+            db, session_id, content, user_id, trace_id, assistant_msg_id,
+            telemetry, memory,
+        ):
+            yield event
+    except Exception as e:
+        logger.exception("process_message 致命异常: %s", str(e))
+        telemetry.end_step("error", error=str(e)[:200])
+        record_trace(telemetry)
+        yield {"event": "token", "data": json.dumps({
+            "token": "\n\n⚠ 系统处理异常，请重试。Trace: {}".format(trace_id),
+        })}
+        yield {"event": "message_done", "data": json.dumps({
+            "messageId": assistant_msg_id, "traceId": trace_id,
+            "status": "error", "error": str(e)[:200],
+        })}
+        try:
+            await save_message(db, session_id, "assistant",
+                "⚠ 系统处理异常，请重试。Trace: {}".format(trace_id), trace_id=trace_id)
+        except Exception:
+            pass
+
+
+async def _process_message_impl(
+    db: AsyncSession, session_id: str, content: str, user_id: str,
+    trace_id: str, assistant_msg_id: str, telemetry, memory,
+):
+    """process_message 实现体，由外层 try/except 保护"""
+    telemetry.start_step("1_安全预检")
+    from app.services.prompt_guard import security_gate
+    security_result = await security_gate(content, use_llm=True)
+    telemetry.end_step("ok", guard_pass=security_result["pass"])
+
+    if not security_result["pass"]:
+        yield {"event": "prompt_injection_detected", "data": json.dumps({
+            "message": security_result["reason"],
+            "severity": security_result["severity"],
+            "blocked": True,
+        })}
+        await save_message(db, session_id, "assistant",
+            f"⚠ {security_result['reason']}", trace_id=trace_id)
+        try:
+            from app.models.audit import AuditRecord
+            audit = AuditRecord(trace_id=trace_id, session_id=session_id,
+                user_id=user_id, event_type="blocked_injection",
+                summary=f"注入拦截 [{security_result['severity']}]: {security_result['reason'][:100]}",
+                risk_level="L5", detail_json=json.dumps(security_result, ensure_ascii=False, default=str))
+            db.add(audit)
+            await db.commit()
+        except Exception:
+            pass
+        yield {"event": "message_done", "data": json.dumps({
+            "messageId": assistant_msg_id, "traceId": trace_id, "status": "blocked_injection"})}
+        return
+
+    # 使用净化后的输入
+    content = security_result.get("sanitized_input", content)
+
+    # ── Step 2: 意图分类 ∥ RAG知识检索（并行执行）──
+    telemetry.start_step("2_意图分类+RAG检索(并行)")
+    import asyncio
+    from app.services.intent_classifier import classify as classify_async, IntentType as NewIntentType
+    from app.services.knowledge_rag import knowledge_rag
+    from app.models.knowledge import KnowledgeArticle
+
+    # 确保 RAG 索引已初始化（非阻塞预热）
+    if not knowledge_rag._initialized:
+        try:
+            result = await db.execute(select(KnowledgeArticle))
+            articles = [{"id": a.id, "title": a.title, "content": a.content,
+                         "category": a.category, "tags": a.tags}
+                        for a in result.scalars().all()]
+            if articles:
+                knowledge_rag.build_index(articles)
+        except Exception:
+            pass
+
+    # 意图分类始终异步执行（含 LLM 调用，~200ms）
+    intent_task = asyncio.ensure_future(classify_async(content))
+
+    # RAG 检索直接同步执行（纯本地计算，通常 <50ms，无需线程池）
+    rag_context = ""
+    try:
+        if knowledge_rag._initialized:
+            rag_context = knowledge_rag.generate_context(content, top_k=3)
+    except Exception:
+        pass
+
+    # 等待意图分类完成
+    intent_result = await intent_task
+
+    yield {"event": "intent", "data": json.dumps({
+        "intent": intent_result["intent"],
+        "confidence": intent_result["confidence"],
+        "matchedKeywords": intent_result.get("matched_keywords", [])[:5],
+        "method": intent_result.get("method", "keyword"),
+    })}
+
+    if rag_context:
+        yield {"event": "rag_context", "data": json.dumps({
+            "sources": [s["title"] for s in knowledge_rag.search(content, top_k=3)] if knowledge_rag._initialized else [],
+        })}
+
+    telemetry.end_step("ok", intent=intent_result["intent"],
+                       confidence=intent_result.get("confidence", 0),
+                       rag_hit=bool(rag_context))
+
+    # ── Step 3: 注入二次确认 ──
+    telemetry.start_step("3_注入二次确认")
+    if intent_result.get("is_injection"):
+        telemetry.end_step("error", blocked=True, reason="injection_detected")
+        record_trace(telemetry)
+        yield {"event": "prompt_injection_detected", "data": json.dumps({
+            "message": "检测到潜在的提示词注入行为",
+            "severity": intent_result.get("injection_severity", "medium"),
+            "blocked": True,
+        })}
+        await save_message(db, session_id, "assistant",
+            "⚠ 检测到潜在的提示词注入行为，该请求已被安全系统拦截。", trace_id=trace_id)
+        yield {"event": "message_done", "data": json.dumps({
+            "messageId": assistant_msg_id, "traceId": trace_id, "status": "blocked_injection"})}
+        return
+
+    telemetry.end_step("ok", intent=intent_result["intent"])
+    intent = intent_result["intent"]
+
+    # ── Step 4: 意图敏感词提醒 ──
+    if intent == IntentType.HIGH_RISK.value:
+        yield {"event": "risk_notice", "data": json.dumps({
+            "message": "您的请求涉及高风险操作，相关指令将需要审批后方可执行。",
+            "intent": "high_risk",
+        })}
 
     # 首条消息时自动更新会话标题
     msg_count_result = await db.execute(
@@ -816,9 +654,64 @@ async def process_message(db: AsyncSession, session_id: str, content: str, user_
 
     yield {"event": "message_start", "data": json.dumps({"messageId": assistant_msg_id, "traceId": trace_id})}
 
-    # 构建对话历史
+    # ── Step 5: 路由分发：纯闲聊 → Handler，其余 → ReAct 循环（可调用工具+RAG）──
+    telemetry.start_step("5_路由分发")
+    if intent == IntentType.GENERAL_QA.value:
+        history = await get_messages(db, session_id)
+        chat_messages = [
+            {"role": m["role"], "content": m["content"]}
+            for m in history["items"] if m["role"] in ("user", "assistant")
+        ]
+        from app.services.task_router import dispatch
+        async for event in dispatch(
+            db, session_id, content, user_id, chat_messages,
+            intent_result=intent_result, trace_id=trace_id,
+            assistant_msg_id=assistant_msg_id,
+        ):
+            yield event
+        return
+
+    # ── RAG 知识增强（已在步骤3并行完成，此处仅对尚未索引的场景做延迟初始化）──
+    if rag_context is None:
+        rag_context = ""
+    if intent in (IntentType.KNOWLEDGE_QA.value, IntentType.FAULT_ANALYSIS.value):
+        try:
+            if not knowledge_rag._initialized:
+                result = await db.execute(select(KnowledgeArticle))
+                articles = []
+                for a in result.scalars().all():
+                    articles.append({"id": a.id, "title": a.title, "content": a.content,
+                        "category": a.category, "tags": a.tags})
+                knowledge_rag.build_index(articles)
+                rag_context = knowledge_rag.generate_context(content, top_k=3)
+                if rag_context:
+                    yield {"event": "rag_context", "data": json.dumps({
+                        "sources": [s["title"] for s in knowledge_rag.search(content, top_k=3)],
+                    })}
+        except Exception as e:
+            logger.warning(f"RAG delayed init failed: {e}")
+
+    # ── 任务编排器（OPS_QUERY / FAULT_ANALYSIS 时启动）──
+    orchestrator = None
+    if intent in (IntentType.OPS_QUERY.value, IntentType.FAULT_ANALYSIS.value):
+        try:
+            from app.services.task_orchestrator import TaskOrchestrator, TaskStage
+            orchestrator = TaskOrchestrator(
+                session_id=session_id, trace_id=trace_id, user_id=user_id)
+            orchestrator.transition(TaskStage.PERCEIVING)
+            yield {"event": "task_progress", "data": json.dumps(orchestrator.get_progress_event())}
+        except Exception as e:
+            logger.warning(f"Task orchestrator init failed: {e}")
+
+    # 构建对话历史（含工具调用 + 会话记忆）
     history = await get_messages(db, session_id)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    memory_context = memory.build_memory_prompt()
+    system_prompt = SYSTEM_PROMPT
+    if memory_context:
+        system_prompt += "\n" + memory_context
+    if rag_context:
+        system_prompt += "\n\n" + rag_context
+    messages = [{"role": "system", "content": system_prompt}]
     for m in history["items"]:
         if m["role"] == "user":
             messages.append({"role": "user", "content": m["content"]})
@@ -919,7 +812,7 @@ async def process_message(db: AsyncSession, session_id: str, content: str, user_
                         })
                         continue
 
-                    # ── 需审批（L3+ 写操作：重启服务、用户管理、iptables修改等）──
+                    # ── 需审批（L4/L5 高危操作：重启服务、用户管理、iptables修改等）──
                     if safety["require_approval"]:
                         risk_desc = _build_risk_description(tool_name, tool_args, safety["risk_level"])
                         now = datetime.utcnow()
@@ -1003,6 +896,19 @@ async def process_message(db: AsyncSession, session_id: str, content: str, user_
                         continue
 
                     # ── L1 安全操作：直接执行 ──
+                    # 权限校验（非阻塞，记录越权操作）
+                    try:
+                        from app.services.permission_service import validate_operation_scope
+                        perm_check = validate_operation_scope(tool_name, tool_args, "admin")
+                        if not perm_check["allowed"]:
+                            yield {"event": "permission_notice", "data": json.dumps({
+                                "toolName": tool_name,
+                                "message": perm_check["message"],
+                                "restricted": True,
+                            })}
+                    except Exception:
+                        pass  # 权限校验失败不阻塞主流程
+
                     yield {"event": "tool_call", "data": json.dumps({
                         "id": tool_call_id,
                         "toolName": tool_name,
@@ -1034,6 +940,25 @@ async def process_message(db: AsyncSession, session_id: str, content: str, user_
                         "content": json.dumps(result, ensure_ascii=False),
                     })
 
+                    # ── 任务编排器步骤追踪 ──
+                    if orchestrator:
+                        step = orchestrator.add_step(tool_name, tool_name, tool_args)
+                        step.status = "completed" if result.get("success", False) else "failed"
+                        step.result = result
+                        from app.services.task_orchestrator import TaskStage
+                        if orchestrator.steps and len(orchestrator.steps) >= 2 and orchestrator.current_stage != TaskStage.EXECUTING:
+                            orchestrator.transition(TaskStage.EXECUTING)
+                        yield {"event": "task_progress", "data": json.dumps(orchestrator.get_progress_event())}
+
+                    # ── 可信度标记 ──
+                    try:
+                        from app.services.context_credibility import CredibilityTracker
+                        tracker = CredibilityTracker()
+                        tag = tracker.tag_source("system_tool", tool_name)
+                        result["_credibility"] = tag
+                    except Exception:
+                        pass
+
                 # 如果有待审批/待确认的操作，停止 ReAct 循环等待用户操作
                 if pending_approval or pending_confirm:
                     yield {"event": "message_done", "data": json.dumps({
@@ -1061,9 +986,42 @@ async def process_message(db: AsyncSession, session_id: str, content: str, user_
                 # Agent 完成回复，没有工具调用
                 break
 
-        except Exception as e:
-            yield {"event": "token", "data": json.dumps({"token": f"\n\n[Agent 调用出错: {str(e)}]"})}
+        except httpx.TimeoutException as e:
+            from app.services.fallback_handler import get_fallback, FallbackReason, classify_fallback, build_error_log
+            fb = get_fallback(FallbackReason.TIMEOUT)
+            yield fb
+            full_response += "\n\n⚠ LLM 服务响应超时，请稍后重试。"
+            logger.warning(f"Task timeout: {build_error_log(FallbackReason.TIMEOUT, str(e), content, trace_id, session_id)}")
             break
+        except httpx.ConnectError as e:
+            from app.services.fallback_handler import get_fallback, FallbackReason, build_error_log
+            fb = get_fallback(FallbackReason.LLM_UNAVAILABLE)
+            yield fb
+            full_response += "\n\n⚠ LLM 服务暂时不可用，请检查网络连接。"
+            logger.warning(f"LLM unavailable: {build_error_log(FallbackReason.LLM_UNAVAILABLE, str(e), content, trace_id, session_id)}")
+            break
+        except Exception as e:
+            from app.services.fallback_handler import get_fallback, FallbackReason, classify_fallback, build_error_log
+            reason = classify_fallback(e)
+            fb = get_fallback(reason, str(e)[:200])
+            yield fb
+            logger.error(f"Agent error: {build_error_log(reason, str(e), content, trace_id, session_id)}")
+            full_response += f"\n\n⚠ Agent 处理异常，请联系管理员。Trace: {trace_id}"
+            break
+
+    # 如果 agent 调用了工具但没有给出文字回复，自动生成摘要
+    if not full_response and tool_call_records:
+        completed = [tc for tc in tool_call_records if tc.get("status") == "completed"]
+        failed = [tc for tc in tool_call_records if tc.get("status") != "completed"]
+        parts = []
+        if completed:
+            parts.append("已执行 {} 个工具：{}".format(
+                len(completed),
+                "、".join(tc["toolName"] for tc in completed[:5])
+            ))
+        if failed:
+            parts.append("{} 个工具执行异常".format(len(failed)))
+        full_response = "。".join(parts) + "。请查看上方详情。"
 
     # 保存 assistant 消息
     await save_message(db, session_id, "assistant", full_response, trace_id=trace_id)
@@ -1073,30 +1031,40 @@ async def process_message(db: AsyncSession, session_id: str, content: str, user_
         await save_message(db, session_id, "tool_call", "",
                            tool_calls=tool_call_records, trace_id=trace_id)
 
-    # 写入审计记录
+    # ── Step 10: 写入审计记录 ──
+    telemetry.start_step("10_审计写入")
     try:
         from app.models.audit import AuditRecord
         tools_used = list(set(tc["toolName"] for tc in tool_call_records)) if tool_call_records else []
         risks = [tc.get("riskLevel", "L1") for tc in tool_call_records] if tool_call_records else ["L1"]
         max_risk = "L4" if "L4" in risks else ("L3" if "L3" in risks else ("L2" if "L2" in risks else "L1"))
+        # 合并遥测数据到审计详情
+        telemetry_json = telemetry.to_audit_json()
+        detail = {
+            "question": content[:200],
+            "answer": full_response[:300],
+            "tools": [{"name": tc["toolName"], "status": tc.get("status"), "risk": tc.get("riskLevel")}
+                      for tc in (tool_call_records or [])],
+            "telemetry": json.loads(telemetry_json),
+        }
         audit = AuditRecord(
             trace_id=trace_id,
             session_id=session_id,
             user_id=user_id,
             event_type="chat",
-            summary=content[:100] if not tools_used else f"调用 {','.join(tools_used)} | {content[:60]}",
+            summary=content[:100] if not tools_used else "调用 {} | {}".format(','.join(tools_used), content[:60]),
             risk_level=max_risk,
-            detail_json=json.dumps({
-                "question": content[:200],
-                "answer": full_response[:300],
-                "tools": [{"name": tc["toolName"], "status": tc.get("status"), "risk": tc.get("riskLevel")}
-                          for tc in (tool_call_records or [])],
-            }, ensure_ascii=False),
+            detail_json=json.dumps(detail, ensure_ascii=False),
         )
         db.add(audit)
         await db.commit()
+        telemetry.end_step("ok")
     except Exception:
+        telemetry.end_step("error")
         pass  # 审计记录写入失败不阻塞对话
+
+    # ── Step 11: 遥测反馈 —— 记录全链路耗时 ──
+    record_trace(telemetry)
 
     yield {"event": "message_done", "data": json.dumps({
         "messageId": assistant_msg_id, "traceId": trace_id,
@@ -1122,7 +1090,7 @@ async def resume_after_approval(db: AsyncSession, session_id: str, user_id: str,
             select(PendingExecution).where(
                 PendingExecution.session_id == session_id,
                 PendingExecution.approval_id == approval_id,
-                PendingExecution.status == "pending",
+                PendingExecution.status.in_(["pending", "approved"]),
             )
         )
     elif pending_execution_id:
@@ -1434,8 +1402,3 @@ async def resume_after_approval(db: AsyncSession, session_id: str, user_id: str,
         "messageId": assistant_msg_id, "traceId": trace_id,
         "usage": {"outputTokens": len(full_response)},
     })}
-
-
-# reload
-
-

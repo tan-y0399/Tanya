@@ -5,6 +5,21 @@
       <p class="page-desc">高危运维操作人工审批，超时自动拒绝</p>
     </div>
 
+    <!-- 最近执行结果 -->
+    <div class="execution-result" v-if="lastExecutionResult">
+      <div class="exec-head">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <circle cx="8" cy="8" r="7" :stroke="lastExecutionResult.success ? '#059669' : '#dc2626'" stroke-width="1.3"/>
+          <path :d="lastExecutionResult.success ? 'M5 8l2 2 4-4' : 'M5.5 5.5l5 5M10.5 5.5l-5 5'" :stroke="lastExecutionResult.success ? '#059669' : '#dc2626'" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+        <span :class="lastExecutionResult.success ? 'text-green' : 'text-red'">
+          {{ lastExecutionResult.success ? '命令已执行成功' : '命令执行失败' }}
+        </span>
+        <button class="exec-close" @click="lastExecutionResult = null">&times;</button>
+      </div>
+      <pre class="exec-output" v-if="lastExecutionResult.result">{{ JSON.stringify(lastExecutionResult.result, null, 2) }}</pre>
+    </div>
+
     <div class="tabs-row">
       <button class="tab-btn" :class="{ active: tab === 'pending' }" @click="tab = 'pending'">
         待审批
@@ -34,19 +49,23 @@
             <pre class="code-mini">{{ JSON.stringify(ap.toolParams, null, 2) }}</pre>
           </div>
         </div>
-        <div class="card-actions">
-          <button class="act-btn approve" @click="handleApprove(ap.id)">
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+        <div class="card-actions" v-if="isAdmin">
+          <button class="act-btn approve" @click="handleApprove(ap.id)" :disabled="approving === ap.id">
+            <svg v-if="approving !== ap.id" width="16" height="16" viewBox="0 0 16 16" fill="none">
               <path d="M3 8l3 3 7-7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
             </svg>
-            通过
+            <span v-else class="btn-spinner"></span>
+            {{ approving === ap.id ? '执行中...' : '通过' }}
           </button>
-          <button class="act-btn reject" @click="handleReject(ap.id)">
+          <button class="act-btn reject" @click="handleReject(ap.id)" :disabled="approving === ap.id">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
               <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
             </svg>
             拒绝
           </button>
+        </div>
+        <div class="card-actions" v-else>
+          <div class="no-permission-tip">仅管理员可审批</div>
         </div>
       </div>
       <div class="empty-state" v-if="!pendingItems.length">
@@ -80,36 +99,67 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
+import { useUserStore } from '@/stores/user'
 import { getPendingApprovals, getApprovalHistory, approveApproval, rejectApproval } from '@/api/approval'
 import { formatTime } from '@/utils'
+import { ElMessage } from 'element-plus'
+
+const userStore = useUserStore()
+const isAdmin = computed(() => userStore.userInfo?.role === 'admin')
 
 const tab = ref<'pending' | 'history'>('pending')
 const pendingItems = ref<any[]>([])
 const pendingTotal = ref(0)
 const historyItems = ref<any[]>([])
+const lastExecutionResult = ref<any>(null)
+const approving = ref<string | null>(null)
 
 async function loadPending() {
   try {
     const data = await getPendingApprovals()
     pendingItems.value = data.items || []
     pendingTotal.value = data.total || 0
-  } catch {}
+  } catch {
+    ElMessage.error('加载待审批列表失败')
+  }
 }
 
 async function loadHistory() {
   try {
     const data = await getApprovalHistory()
     historyItems.value = data.items || []
-  } catch {}
+  } catch {
+    ElMessage.error('加载审批历史失败')
+  }
 }
 
 async function handleApprove(id: string) {
-  try { await approveApproval(id, '确认执行'); await loadPending() } catch {}
+  approving.value = id
+  try {
+    const res = await approveApproval(id, '确认执行')
+    ElMessage.success(res?.data?.message || res?.message || '审批通过')
+    await loadPending()
+    await loadHistory()
+  } catch (e: any) {
+    const detail = e?.response?.data?.detail || e?.message || '操作失败'
+    ElMessage.error('审批失败: ' + detail)
+  }
+  finally { approving.value = null }
 }
 
 async function handleReject(id: string) {
-  try { await rejectApproval(id, '不予执行'); await loadPending() } catch {}
+  approving.value = id
+  try {
+    const res = await rejectApproval(id, '不予执行')
+    ElMessage.warning(res?.data?.message || res?.message || '已拒绝')
+    await loadPending()
+    await loadHistory()
+  } catch (e: any) {
+    const detail = e?.response?.data?.detail || e?.message || '操作失败'
+    ElMessage.error('拒绝失败: ' + detail)
+  }
+  finally { approving.value = null }
 }
 
 onMounted(() => { loadPending(); loadHistory() })
@@ -117,6 +167,44 @@ onMounted(() => { loadPending(); loadHistory() })
 
 <style lang="scss" scoped>
 .approval-page { max-width: 900px; margin: 0 auto; }
+
+.execution-result {
+  margin-bottom: 16px;
+  padding: 14px 16px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  .exec-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    font-weight: 600;
+    .text-green { color: #059669; }
+    .text-red { color: #dc2626; }
+    .exec-close {
+      margin-left: auto;
+      background: none;
+      border: none;
+      font-size: 18px;
+      cursor: pointer;
+      color: #94a3b8;
+      &:hover { color: #1e293b; }
+    }
+  }
+  .exec-output {
+    margin-top: 10px;
+    font-size: 12px;
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    padding: 10px;
+    max-height: 200px;
+    overflow: auto;
+    font-family: 'JetBrains Mono', monospace;
+    color: #334155;
+  }
+}
 
 .page-header {
   margin-bottom: 20px;
@@ -233,6 +321,23 @@ onMounted(() => { loadPending(); loadHistory() })
   }
 }
 
+.btn-spinner {
+  width: 14px; height: 14px;
+  border: 2px solid #a7f3d0;
+  border-top-color: #059669;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+  display: inline-block;
+}
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.no-permission-tip {
+  font-size: 12px; color: #94a3b8;
+  padding: 10px 0; text-align: center;
+}
 .empty-state { text-align: center; padding: 48px; color: #94a3b8; }
 
 .ok { color: #059669; font-weight: 600; }

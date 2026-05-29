@@ -21,11 +21,21 @@ router = APIRouter(prefix="/auth", tags=["认证"])
 # ============================================================
 @router.post("/login")
 async def login(req: dict = Body(...), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).where(User.username == req["username"]))
+    username = req.get("username", "")
+    password = req.get("password", "")
+    login_role = req.get("loginRole", "")
+
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="用户名和密码不能为空")
+
+    result = await db.execute(select(User).where(User.username == username))
     user = result.scalar_one_or_none()
 
-    if not user or not verify_password(req["password"], user.password_hash):
+    if not user or not verify_password(password, user.password_hash):
         raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+    if login_role and user.role != login_role:
+        raise HTTPException(status_code=403, detail=f"当前入口仅允许{login_role}角色登录")
 
     token = create_access_token({"sub": user.id, "username": user.username, "role": user.role})
     return {
@@ -138,7 +148,7 @@ async def login_by_phone(req: dict = Body(...), db: AsyncSession = Depends(get_d
         user = User(
             username=phone,
             password_hash=hash_password(phone + "-kylinops-phone"),
-            role="admin",
+            role="user",
         )
         db.add(user)
         await db.commit()
@@ -399,7 +409,7 @@ async def register_by_email(req: dict = Body(...), db: AsyncSession = Depends(ge
     await db.commit()
 
     # 创建用户（bcrypt 哈希密码）
-    user = User(username=email, password_hash=hash_password(password), role="admin")
+    user = User(username=email, password_hash=hash_password(password), role="user")
     db.add(user)
     await db.commit()
     await db.refresh(user)
@@ -413,6 +423,33 @@ async def register_by_email(req: dict = Body(...), db: AsyncSession = Depends(ge
             "user": {"id": user.id, "username": user.username, "role": user.role},
         },
     }
+
+
+@router.post("/register")
+async def register_user(req: dict = Body(...), db: AsyncSession = Depends(get_db)):
+    """用户名 + 密码 注册（普通用户）"""
+    username = (req.get("username") or "").strip()
+    password = req.get("password") or ""
+
+    if not username or len(username) < 2:
+        raise HTTPException(status_code=400, detail="用户名至少2个字符")
+    if len(username) > 32:
+        raise HTTPException(status_code=400, detail="用户名不能超过32个字符")
+    if not password or len(password) < 6:
+        raise HTTPException(status_code=400, detail="密码至少6位")
+
+    # 检查用户名是否已存在
+    result = await db.execute(select(User).where(User.username == username))
+    if result.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="用户名已存在")
+
+    # 普通用户注册，固定 role=user
+    user = User(username=username, password_hash=hash_password(password), role="user")
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+
+    return {"code": 0, "message": "注册成功，请前往登录", "data": {"username": user.username}}
 
 
 @router.post("/login-by-email")

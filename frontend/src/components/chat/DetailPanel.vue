@@ -46,7 +46,7 @@
             <div class="detail-label">状态</div>
             <div class="detail-value">
               <span class="status-chip" :class="toolDetail.status">
-                {{ {executing:'执行中',completed:'已完成',rejected:'已拒绝',timeout:'超时'}[toolDetail.status] }}
+                {{ {executing:'执行中',completed:'已完成',rejected:'已拒绝',timeout:'超时',blocked:'已阻止',pending_approval:'待审批',pending_confirm:'待确认'}[toolDetail.status] }}
               </span>
             </div>
           </div>

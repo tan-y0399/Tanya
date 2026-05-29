@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+.eggs/
+
+# Virtual environment
+venv/
+ENV/
+env/
+.venv/
+
+# Database files
+*.db
+*.sqlite3
+backend/data/*.db
+backend/data/audit.db
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Node.js
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Build artifacts
+*.log
+npm-debug.log*
+
+# Init flags
+.initialized
+
+# Alembic (if used)
+alembic/versions/
+
+# Temp / cache
+*.tmp
+*.temp
+.cache/
+update1
