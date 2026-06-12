@@ -58,10 +58,19 @@ GROUP_CONFIG: Dict[CommandGroup, Dict] = {
             "more", "zcat", "zgrep", "awk", "sed", "cut", "sort", "uniq",
             "wc", "find", "locate", "which", "whereis", "file", "stat",
             "ls", "pwd", "echo", "date", "hostname", "uname",
+            "lpstat", "lpoptions", "lpinfo",
         ],
         "risk_level": RiskLevel.SAFE,
         "require_approval": False,
         "require_confirm": False,
+        "special_rules": {
+            "journalctl": {
+                "args_match": r"--vacuum",
+                "require_confirm": True,
+                "require_approval": True,
+                "risk_level": RiskLevel.MEDIUM,
+            },
+        },
     },
     CommandGroup.PROCESS_MANAGEMENT: {
         "name": "进程管理",
@@ -171,7 +180,10 @@ GROUP_CONFIG: Dict[CommandGroup, Dict] = {
             "apt-get": {"args_match": r"(install|remove|purge|update|upgrade|dist-upgrade)", "require_approval": True},
             "pip": {"args_match": r"(install|uninstall)", "require_approval": True},
             "pip3": {"args_match": r"(install|uninstall)", "require_approval": True},
-            "rpm": {"default_approval": True},
+            "rpm": {
+                "args_match": r"(-e|--erase|-U|--upgrade|-F|--freshen|--reinstall|-i|--install|-ivh)",
+                "require_approval": True,
+            },
         },
     },
     CommandGroup.FIREWALL: {
@@ -288,7 +300,7 @@ BYPASS_PATTERNS: List[Tuple[object, str]] = [
     (re.compile(r'(?i)history\s+-c'), "清除命令历史"),
     (re.compile(r'(?i)unset\s+HISTFILE'), "禁用历史记录"),
     # 时间/条件绕过
-    (re.compile(r'(?i)(at|batch)\s+'), "延迟执行"),
+    (re.compile(r'(?i)\b(at|batch)\s+'), "延迟执行"),
     (re.compile(r'(?i)nohup\s+'), "后台持续执行"),
 ]
 
@@ -432,6 +444,24 @@ def analyze_command(command: str) -> Dict:
         base["reason"] = "空命令"
         return base
 
+    # RPM/DNF 只读查询（L1 直接执行）
+    if cmd_name == "rpm" and re.search(r"(^|\s)(-q|--query|-qa|-qi|-ql|-qf|-qR)\b", command.strip(), re.I):
+        base["group"] = CommandGroup.PACKAGE_MGMT.value
+        base["group_name"] = GROUP_CONFIG[CommandGroup.PACKAGE_MGMT]["name"]
+        base["risk_level"] = RiskLevel.SAFE.value
+        base["require_approval"] = False
+        base["require_confirm"] = False
+        base["reason"] = "RPM 包查询（只读）"
+        return base
+    if cmd_name in ("dnf", "yum") and re.search(r"\b(list|info|provides|search|history)\b", command, re.I):
+        base["group"] = CommandGroup.PACKAGE_MGMT.value
+        base["group_name"] = GROUP_CONFIG[CommandGroup.PACKAGE_MGMT]["name"]
+        base["risk_level"] = RiskLevel.SAFE.value
+        base["require_approval"] = False
+        base["require_confirm"] = False
+        base["reason"] = "包管理器只读查询"
+        return base
+
     # L2: 黑名单（硬阻断）
     blacklist_result = _check_blacklist(command)
     if blacklist_result:
@@ -464,6 +494,58 @@ def analyze_command(command: str) -> Dict:
     # 访问安全文件 → 至少需确认
     if any("安全文件" in d.get("description", "") for d in dangerous):
         base["require_confirm"] = True
+
+    # 时间同步：只读查询（L1 直接执行）
+    _TIME_READONLY = (
+        (re.compile(r"^timedatectl\s+(status|show|timesync-status|show-timesync-status)\b", re.I), "查看时间同步状态"),
+        (re.compile(r"^chronyc\s+(tracking|sources|sourcestats|activity)\b", re.I), "查看 chrony 状态"),
+        (re.compile(r"^systemctl\s+status\s+chronyd?\b", re.I), "查看 chronyd 服务状态"),
+        (re.compile(r"^date(\s|$)", re.I), "查看当前系统时间"),
+    )
+    for pattern, reason in _TIME_READONLY:
+        if pattern.search(command.strip()):
+            base["risk_level"] = RiskLevel.SAFE.value
+            base["require_approval"] = False
+            base["require_confirm"] = False
+            base["reason"] = reason
+            return base
+
+    # 网络只读查询（L1 直接执行，避免 cat /proc/net/dev 等被误判为 L4）
+    _NETWORK_READONLY = (
+        (re.compile(r"^cat\s+/proc/net/(dev|snmp|softnet_stat)\b", re.I), "查看网络接口统计"),
+        (re.compile(r"^ip\s+-s\s+(link|addr)\b", re.I), "查看网卡流量统计"),
+        (re.compile(r"^ip\s+link\s+show\b", re.I), "查看网络接口状态"),
+        (re.compile(r"^cat\s+/sys/class/net/[^/\s]+/statistics/\w+\b", re.I), "读取网卡计数器"),
+        (re.compile(r"^sar\s+-n\s+(DEV|EDEV)\b", re.I), "查看网络吞吐统计"),
+        (re.compile(r"^ss\s+-s\b", re.I), "查看网络连接摘要"),
+    )
+    for pattern, reason in _NETWORK_READONLY:
+        if pattern.search(command.strip()):
+            base["risk_level"] = RiskLevel.SAFE.value
+            base["require_approval"] = False
+            base["require_confirm"] = False
+            base["reason"] = reason
+            return base
+
+    # 时间同步：写操作
+    if re.search(r"^timedatectl\s+set-ntp\s+(true|1)\b", command.strip(), re.I):
+        base["risk_level"] = RiskLevel.MEDIUM.value
+        base["require_approval"] = False
+        base["require_confirm"] = True
+        base["reason"] = "启用 NTP 时间同步（需用户确认）"
+        return base
+    if re.search(r"^chronyc\s+(-a\s+)?makestep\b", command.strip(), re.I):
+        base["risk_level"] = RiskLevel.MEDIUM.value
+        base["require_approval"] = False
+        base["require_confirm"] = True
+        base["reason"] = "强制 chrony 对时（需用户确认）"
+        return base
+    if re.search(r"^timedatectl\s+set-time\b", command.strip(), re.I):
+        base["risk_level"] = RiskLevel.HIGH.value
+        base["require_approval"] = True
+        base["require_confirm"] = True
+        base["reason"] = "手动设置系统时间（高风险）"
+        return base
 
     # L1: 命令分组（不覆盖已有的高风险标记）
     group = get_command_group(cmd_name)
@@ -498,8 +580,10 @@ def analyze_command(command: str) -> Dict:
         if re.search(args_match, args_str):
             if "risk_level" in special:
                 base["risk_level"] = special["risk_level"].value if isinstance(special["risk_level"], RiskLevel) else special["risk_level"]
-            if special.get("require_approval"):
-                base["require_approval"] = True
+            if "require_approval" in special:
+                base["require_approval"] = bool(special["require_approval"])
+            if "require_confirm" in special:
+                base["require_confirm"] = bool(special["require_confirm"])
             # 子规则检查
             for sub_pattern, sub_rule in special.get("sub_check", {}).items():
                 if re.search(sub_pattern, args_str):
@@ -512,7 +596,64 @@ def analyze_command(command: str) -> Dict:
     if special.get("default_approval"):
         base["require_approval"] = True
 
+    # 包管理：clean/autoclean/autoremove 降为 L2 确认（非 L4 审批）
+    if cmd_name in ("apt-get", "apt") and re.search(r"\b(clean|autoclean|autoremove)\b", command, re.I):
+        base["require_approval"] = False
+        base["require_confirm"] = True
+        base["risk_level"] = RiskLevel.LOW.value
+        base["reason"] = "APT 缓存清理（低风险，需用户确认）"
+    if cmd_name in ("dnf", "yum") and re.search(r"\bclean\b", command, re.I):
+        base["require_approval"] = False
+        base["require_confirm"] = True
+        base["risk_level"] = RiskLevel.LOW.value
+        base["reason"] = "DNF/YUM 缓存清理（低风险，需用户确认）"
+
+    # L5: 路径保护 — 从命令参数提取路径并校验
+    path_findings = _check_path_protections(command)
+    for pf in path_findings:
+        base["findings"].append(pf)
+    if path_findings:
+        if any(pf.get("blocked") for pf in path_findings):
+            base["blocked"] = True
+            base["block_message"] = path_findings[0].get("message", "受保护路径，禁止操作")
+            base["risk_level"] = RiskLevel.FATAL.value
+            return base
+        base["require_approval"] = True
+        base["require_confirm"] = True
+        base["risk_level"] = max_risk(base["risk_level"], RiskLevel.HIGH.value)
+        base["reason"] = base["reason"] or "涉及受保护路径"
+
     return base
+
+
+def _extract_paths_from_command(command: str) -> List[str]:
+    """从命令中提取可能的目标路径。"""
+    paths = []
+    # rm/chmod/chown/cat/echo > 等后的路径
+    for m in re.finditer(r"(?:^|\s)(/(?:[\w.-]+/)*[\w.-]+)", command):
+        paths.append(m.group(1))
+    for m in re.finditer(r"(>>?)\s*(/(?:[\w.-]+/)*[\w.-]+)", command):
+        paths.append(m.group(2))
+    return paths
+
+
+def _check_path_protections(command: str, extra_whitelist: List[str] = None) -> List[dict]:
+    """L5 路径保护校验。"""
+    findings = []
+    write_verbs = re.compile(r"\b(rm|mv|chmod|chown|chattr|dd|mkfs|truncate|shred)\b", re.I)
+    if not write_verbs.search(command):
+        return findings
+
+    for path in _extract_paths_from_command(command):
+        result = validate_path(path)
+        if not result["safe"]:
+            findings.append({
+                "type": "path_protection",
+                "path": path,
+                "message": result["message"],
+                "blocked": True,
+            })
+    return findings
 
 
 def get_risk_level_info(risk_level: str) -> Dict:

@@ -1,7 +1,8 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime, Text
+from sqlalchemy import Column, String, DateTime
 from app.core.database import Base
+from app.models.json_type import JSONType
 
 
 def gen_id() -> str:
@@ -18,5 +19,5 @@ class AuditRecord(Base):
     event_type = Column(String(32), nullable=False)
     summary = Column(String(500), default="")
     risk_level = Column(String(4), nullable=True)
-    detail_json = Column(Text, nullable=True)
+    detail_json = Column(JSONType, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)

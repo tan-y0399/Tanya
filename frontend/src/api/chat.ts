@@ -31,6 +31,53 @@ export async function getMessages(sessionId: string, page = 1, size = 50) {
   return data.data
 }
 
+export async function getAwaitingRun(sessionId: string) {
+  const { data } = await api.get(`/chat/sessions/${sessionId}/awaiting-run`)
+  return data.data
+}
+
+export async function getPendingPlan(sessionId: string) {
+  const { data } = await api.get(`/chat/sessions/${sessionId}/pending-plan`)
+  return data.data
+}
+
+export async function cancelAwaitingRun(sessionId: string, payload: { approvalId?: string; pendingExecutionId?: string }) {
+  const { data } = await api.post(`/chat/sessions/${sessionId}/cancel-run`, payload)
+  return data
+}
+
+export interface RollbackToolStatus {
+  logId: string
+  reversible: boolean
+  rolledBack: boolean
+  rollbackHint: string
+  toolName: string
+}
+
+/** 查询会话内工具可回滚状态 */
+export async function getRollbackStatus(sessionId: string): Promise<{
+  byToolCallId: Record<string, RollbackToolStatus>
+  pendingRollbackCount: number
+  hasFullRollback: boolean
+}> {
+  const { data } = await api.get(`/chat/sessions/${sessionId}/rollback-status`)
+  return data.data
+}
+
+/** 单步/全量回滚（阶段3子步骤4） */
+export async function rollbackSession(
+  sessionId: string,
+  mode: 'single_step' | 'full' = 'single_step',
+  opts?: { logId?: string; toolCallId?: string },
+) {
+  const { data } = await api.post(`/chat/sessions/${sessionId}/rollback`, {
+    mode,
+    logId: opts?.logId,
+    toolCallId: opts?.toolCallId,
+  })
+  return data.data
+}
+
 export interface SendMessageCallbacks {
   onToken: (token: string) => void
   onToolCall: (tool: any) => void
@@ -51,6 +98,114 @@ export interface SendMessageCallbacks {
   onSafetyDecision?: (safety: any) => void
   onReasoningChain?: (chain: any) => void
   onStateCards?: (cards: any) => void
+  onExploringStep?: (step: any) => void
+  onIntentResolved?: (payload: any) => void
+  onResponsePhase?: (payload: { phase: string; message?: string; detail?: string }) => void
+  onSummaryStart?: (payload: { title?: string }) => void
+  onSummaryDone?: () => void
+  onToolCallsUpdated?: (payload: { messageId?: string; toolCalls?: any[] }) => void
+  onDiagnosticPlan?: (payload: any) => void
+  onEnvPrecheck?: (payload: any) => void
+  onPlanProgress?: (payload: any) => void
+  onRouteDispatch?: (payload: any) => void
+  onTaskProgress?: (payload: any) => void
+  onOpsReport?: (payload: any) => void
+}
+
+function dispatchSseEvent(eventName: string, payload: any, cbs: SendMessageCallbacks) {
+  switch (eventName) {
+    case 'token': cbs.onToken(payload.token); break
+    case 'tool_call': cbs.onToolCall(payload); break
+    case 'tool_result': cbs.onToolResult(payload); break
+    case 'need_approval': cbs.onApprovalRequired(payload); break
+    case 'need_confirm': cbs.onConfirmRequired(payload); break
+    case 'blocked': cbs.onBlocked(payload); break
+    case 'message_start': break
+    case 'message_done': cbs.onDone(payload); break
+    case 'error': cbs.onError(payload); break
+    case 'stage_update': cbs.onStageUpdate?.(payload); break
+    case 'intent': cbs.onIntent?.(payload); cbs.onIntentResolved?.(payload); break
+    case 'intent_resolved': cbs.onIntentResolved?.(payload); break
+    case 'response_phase': cbs.onResponsePhase?.(payload); break
+    case 'summary_start': cbs.onSummaryStart?.(payload); break
+    case 'summary_done': cbs.onSummaryDone?.(); break
+    case 'tool_calls_updated': cbs.onToolCallsUpdated?.(payload); break
+    case 'prompt_injection_detected': cbs.onPromptInjection?.(payload); break
+    case 'rag_context': break
+    case 'reasoning_step': cbs.onReasoningStep?.(payload); break
+    case 'safety_decision': cbs.onSafetyDecision?.(payload); break
+    case 'reasoning_chain': cbs.onReasoningChain?.(payload); break
+    case 'state_cards': cbs.onStateCards?.(payload); break
+    case 'exploring_step': cbs.onExploringStep?.(payload); break
+    case 'error_fallback': cbs.onErrorFallback?.(payload); break
+    case 'risk_notice': cbs.onRiskNotice?.(payload); break
+    case 'permission_notice': cbs.onPermissionNotice?.(payload); break
+    case 'diagnostic_plan': cbs.onDiagnosticPlan?.(payload); break
+    case 'env_precheck': cbs.onEnvPrecheck?.(payload); break
+    case 'plan_progress': cbs.onPlanProgress?.(payload); break
+    case 'route_dispatch': cbs.onRouteDispatch?.(payload); break
+    case 'task_progress': cbs.onTaskProgress?.(payload); break
+    case 'ops_report': cbs.onOpsReport?.(payload); break
+    default: break
+  }
+}
+
+function safeDispatchSseEvent(eventName: string, payload: unknown, cbs: SendMessageCallbacks) {
+  try {
+    dispatchSseEvent(eventName, payload, cbs)
+  } catch (e) {
+    console.warn('[SSE] handler error:', eventName, e)
+  }
+}
+
+/** 按行解析 SSE（空行分隔事件），兼容分块边界与流结束 */
+class SseLineParser {
+  private buffer = ''
+  private eventName = ''
+  private dataLines: string[] = []
+
+  private dispatchEvent(cbs: SendMessageCallbacks) {
+    if (!this.dataLines.length) {
+      this.eventName = ''
+      return
+    }
+    const dataStr = this.dataLines.join('\n')
+    const name = this.eventName
+    this.eventName = ''
+    this.dataLines = []
+    try {
+      safeDispatchSseEvent(name, JSON.parse(dataStr), cbs)
+    } catch (e) {
+      console.warn('[SSE] JSON parse failed:', name, dataStr.slice(0, 120), e)
+    }
+  }
+
+  feed(chunk: string, cbs: SendMessageCallbacks) {
+    this.buffer += chunk.replace(/\r\n/g, '\n')
+    for (;;) {
+      const nl = this.buffer.indexOf('\n')
+      if (nl === -1) break
+      let line = this.buffer.slice(0, nl)
+      this.buffer = this.buffer.slice(nl + 1)
+      if (line.endsWith('\r')) line = line.slice(0, -1)
+      if (line === '') {
+        this.dispatchEvent(cbs)
+        continue
+      }
+      if (line.startsWith('event: ')) this.eventName = line.slice(7).trim()
+      else if (line.startsWith('data: ')) this.dataLines.push(line.slice(6))
+    }
+  }
+
+  finish(cbs: SendMessageCallbacks) {
+    if (this.buffer.trim()) {
+      let line = this.buffer.replace(/\r$/, '')
+      this.buffer = ''
+      if (line.startsWith('event: ')) this.eventName = line.slice(7).trim()
+      else if (line.startsWith('data: ')) this.dataLines.push(line.slice(6))
+    }
+    this.dispatchEvent(cbs)
+  }
 }
 
 export function sendMessage(
@@ -60,22 +215,14 @@ export function sendMessage(
   pendingApprovalId?: string,
   pendingExecutionId?: string,
   serverId?: string,
+  confirmPlanId?: string,
 ): AbortController {
   const controller = new AbortController()
-  const {
-    onToken, onToolCall, onToolResult,
-    onApprovalRequired, onConfirmRequired, onBlocked,
-    onError, onDone,
-    onIntent, onPromptInjection, onErrorFallback,
-    onRiskNotice, onPermissionNotice,
-    onStageUpdate, onReasoningStep, onSafetyDecision,
-    onReasoningChain, onStateCards,
-  } = callbacks
-
   const body: any = { sessionId, content }
   if (pendingApprovalId) body.pendingApprovalId = pendingApprovalId
   if (pendingExecutionId) body.pendingExecutionId = pendingExecutionId
   if (serverId) body.serverId = serverId
+  if (confirmPlanId) body.confirmPlanId = confirmPlanId
 
   fetch('/api/v1/chat/send', {
     method: 'POST',
@@ -89,58 +236,104 @@ export function sendMessage(
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const reader = res.body!.getReader()
     const decoder = new TextDecoder()
-    let buffer = ''
+    const parser = new SseLineParser()
 
     while (true) {
       const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split('\n')
-      buffer = lines.pop() || ''
-      let currentEvent = ''
-      for (const line of lines) {
-        if (line.startsWith('event: ')) {
-          currentEvent = line.slice(7).trim()
-          continue
-        }
-        if (line.startsWith('data: ')) {
-          try {
-            const payload = JSON.parse(line.slice(6))
-            switch (currentEvent) {
-              // 基础事件
-              case 'token': onToken(payload.token); break
-              case 'tool_call': onToolCall(payload); break
-              case 'tool_result': onToolResult(payload); break
-              case 'need_approval': onApprovalRequired(payload); break
-              case 'need_confirm': onConfirmRequired(payload); break
-              case 'blocked': onBlocked(payload); break
-              case 'message_start': break
-              case 'message_done': onDone(payload); break
-              case 'error': onError(payload); break
-
-              // LangGraph 阶段事件
-              case 'stage_update': onStageUpdate?.(payload); break
-              case 'intent': onIntent?.(payload); break
-              case 'prompt_injection_detected': onPromptInjection?.(payload); break
-              case 'rag_context': break
-              case 'reasoning_step': onReasoningStep?.(payload); break
-              case 'safety_decision': onSafetyDecision?.(payload); break
-              case 'reasoning_chain': onReasoningChain?.(payload); break
-              case 'state_cards': onStateCards?.(payload); break
-
-              // 其他事件
-              case 'error_fallback': onErrorFallback?.(payload); break
-              case 'risk_notice': onRiskNotice?.(payload); break
-              case 'permission_notice': onPermissionNotice?.(payload); break
-            }
-          } catch { /* skip parse errors */ }
-        }
+      if (value) {
+        parser.feed(decoder.decode(value, { stream: !done }), callbacks)
+      }
+      if (done) {
+        parser.finish(callbacks)
+        break
       }
     }
   }).catch((err: any) => {
     if (err?.name === 'AbortError') return
-    onError(err)
+    callbacks.onError(err)
   })
 
   return controller
 }
+
+/** 方案卡壳时续跑下一步（SSE） */
+export function continuePlanExecution(
+  sessionId: string,
+  callbacks: SendMessageCallbacks,
+  serverId?: string,
+): AbortController {
+  const controller = new AbortController()
+  const body: any = {}
+  if (serverId) body.serverId = serverId
+
+  fetch(`/api/v1/chat/sessions/${sessionId}/continue-plan`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${localStorage.getItem('token')}`,
+    },
+    body: JSON.stringify(body),
+    signal: controller.signal,
+  }).then(async (res) => {
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const reader = res.body!.getReader()
+    const decoder = new TextDecoder()
+    const parser = new SseLineParser()
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (value) {
+        parser.feed(decoder.decode(value, { stream: !done }), callbacks)
+      }
+      if (done) {
+        parser.finish(callbacks)
+        break
+      }
+    }
+  }).catch((err: any) => {
+    if (err?.name === 'AbortError') return
+    callbacks.onError?.(err)
+  })
+
+  return controller
+}
+
+/** 审批拒绝/超时后，补全 Agent 执行结论（SSE） */
+export function finalizeApprovalRejection(
+  sessionId: string,
+  approvalId: string,
+  callbacks: Pick<
+    SendMessageCallbacks,
+    'onToken' | 'onSummaryStart' | 'onSummaryDone' | 'onToolCallsUpdated' | 'onError' | 'onDone'
+  >,
+): Promise<void> {
+  return fetch(`/api/v1/chat/sessions/${sessionId}/approval-rejected`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${localStorage.getItem('token')}`,
+    },
+    body: JSON.stringify({ approvalId }),
+  }).then(async (res) => {
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const reader = res.body!.getReader()
+    const decoder = new TextDecoder()
+    const parser = new SseLineParser()
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (value) {
+        parser.feed(decoder.decode(value, { stream: !done }), callbacks as SendMessageCallbacks)
+      }
+      if (done) {
+        parser.finish(callbacks as SendMessageCallbacks)
+        break
+      }
+    }
+  }).catch((err: any) => {
+    callbacks.onError?.(err)
+    throw err
+  })
+}
+
+export type { Session, Message }

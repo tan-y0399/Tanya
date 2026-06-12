@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime
 from sqlalchemy import Column, String, DateTime, ForeignKey, Text
 from app.core.database import Base
+from app.models.json_type import JSONType
 
 
 def gen_id() -> str:
@@ -25,6 +26,6 @@ class Message(Base):
     session_id = Column(String(24), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True)
     role = Column(String(16), nullable=False)
     content = Column(Text, default="")
-    tool_calls_json = Column(Text, nullable=True)
+    tool_calls_json = Column(JSONType, nullable=True)
     trace_id = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)

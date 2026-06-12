@@ -1,6 +1,6 @@
 <template>
-  <div class="agent-msg">
-    <div class="msg-avatar">
+  <div class="agent-msg" :class="{ 'agent-msg--continuation': continuation }">
+    <div v-if="!continuation" class="msg-avatar">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
         <rect x="3" y="3" width="18" height="18" rx="5" stroke="#2563eb" stroke-width="1.5"/>
         <circle cx="9" cy="10" r="2" stroke="#2563eb" stroke-width="1.2"/>
@@ -9,13 +9,13 @@
       </svg>
     </div>
     <div class="msg-body">
-      <div class="msg-meta">
+      <div v-if="!continuation" class="msg-meta">
         <span class="msg-role">KylinOps Agent</span>
         <span v-if="maxRiskLevel && maxRiskLevel !== 'L1'" class="risk-badge" :class="'risk-' + maxRiskLevel.toLowerCase()">{{ maxRiskLevel }}</span>
         <span class="msg-time">{{ formattedTime }}</span>
       </div>
-      <div class="msg-content" v-html="renderedContent"></div>
-      <div class="msg-trace" v-if="traceId" @click="$emit('viewTrace', traceId)">
+      <div v-if="content?.trim()" class="msg-content" v-html="renderedContent"></div>
+      <div class="msg-trace" v-if="traceId && !hideTrace" @click="$emit('viewTrace', traceId)">
         <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
           <circle cx="6" cy="6" r="5" stroke="currentColor" stroke-width="1"/>
           <path d="M6 3v3l2 2" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
@@ -36,6 +36,10 @@ const props = defineProps<{
   traceId?: string
   createdAt: string
   maxRiskLevel?: string
+  /** 续接正文：不重复头像与元信息，与首段左对齐 */
+  continuation?: boolean
+  /** 正文在下方单独展示时，头部不重复显示推理链路 */
+  hideTrace?: boolean
 }>()
 
 defineEmits<{ viewTrace: [traceId: string] }>()
@@ -58,6 +62,11 @@ const shortTraceId = computed(() => props.traceId ? props.traceId.slice(0, 28) +
   gap: 12px;
   padding: 10px 0;
   animation: fadeIn 0.25s ease;
+
+  &--continuation {
+    padding-top: 0;
+    margin-left: 46px;
+  }
 }
 
 .msg-avatar {

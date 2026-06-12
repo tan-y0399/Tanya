@@ -5,6 +5,8 @@ from app.models.knowledge import KnowledgeArticle
 from app.models.approval import Approval
 from app.models.pending_execution import PendingExecution
 from app.models.feedback import Feedback
+from app.models.supervision import SupervisionPlan, TraceOutcome
+from app.models.execution_log import ExecutionLog
 
 __all__ = [
     "Session",
@@ -14,4 +16,7 @@ __all__ = [
     "Approval",
     "PendingExecution",
     "Feedback",
+    "SupervisionPlan",
+    "TraceOutcome",
+    "ExecutionLog",
 ]

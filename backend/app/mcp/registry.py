@@ -41,7 +41,9 @@ TOOL_MAP: Dict[str, ToolHandler] = {
     "get_network_info": remote_executor.get_network_info,
     "get_network_connections": remote_executor.get_network_connections,
     "get_network_interfaces": remote_executor.get_network_interfaces,
+    "get_network_speed": remote_executor.get_network_speed,
     "get_process_list": remote_executor.get_process_list,
+    "list_processes": remote_executor.get_process_list,
     "get_process_detail": remote_executor.get_process_detail,
     "kill_process": remote_executor.kill_process,
     "get_service_status": remote_executor.get_service_status,
@@ -69,8 +71,11 @@ def list_tools() -> List[Dict[str, Any]]:
 
 
 def get_tool_definition(name: str) -> Dict[str, Any] | None:
+    from app.services.tool_args import resolve_remote_tool_name
+
+    lookup = resolve_remote_tool_name(name)
     for item in remote_executor.TOOL_DESCRIPTIONS:
-        if item["name"] == name:
+        if item["name"] == lookup or item["name"] == name:
             return {
                 "name": item["name"],
                 "description": item["description"],
@@ -80,10 +85,13 @@ def get_tool_definition(name: str) -> Dict[str, Any] | None:
 
 
 def call_tool(name: str, arguments: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    handler = TOOL_MAP.get(name)
+    from app.services.tool_args import normalize_tool_args, resolve_remote_tool_name
+
+    internal_name = resolve_remote_tool_name(name)
+    handler = TOOL_MAP.get(internal_name) or TOOL_MAP.get(name)
     if handler is None:
         return {"success": False, "error": f"Unknown tool: {name}"}
-    arguments = arguments or {}
+    arguments = normalize_tool_args(internal_name, arguments or {})
     try:
         return handler(**arguments)
     except TypeError as exc:

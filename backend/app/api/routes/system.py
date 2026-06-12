@@ -1,7 +1,12 @@
 import os
+import time
 from fastapi import APIRouter, Depends, Body, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from app.core.config import settings
+from app.core.database import get_db
 from app.core.security import get_current_user
+from app.models.server import Server
 
 router = APIRouter(prefix="/system", tags=["系统"])
 
@@ -11,23 +16,55 @@ _ENV_PATH = os.path.abspath(_ENV_PATH)
 
 
 @router.get("/health")
-async def health():
-    # 检查远程VM连通性
+async def health(db: AsyncSession = Depends(get_db)):
     vm_status = "unknown"
     vm_latency = None
+    vm_host = settings.ssh_host
+    vm_port = settings.ssh_port
+    vm_username = settings.ssh_user
+    vm_server_name = None
+
+    result = await db.execute(select(Server).where(Server.is_default == True))
+    default_server = result.scalar_one_or_none()
+    if default_server:
+        vm_host = default_server.host
+        vm_port = default_server.port
+        vm_username = default_server.username
+        vm_server_name = default_server.name
+
     try:
-        from app.services.ssh_client import get_ssh_client
-        import time
+        from app.services.ssh_client import SSHClient, SSH_POOL
+
         t0 = time.time()
-        ssh = get_ssh_client()
+        if default_server:
+            ssh = SSH_POOL.get_or_create(
+                default_server.id,
+                default_server.host,
+                default_server.port,
+                default_server.username,
+                default_server.key_path,
+            )
+        else:
+            ssh = SSHClient()
+            ssh.connect()
+
         if ssh.is_alive():
             vm_status = "up"
         else:
             ssh.reconnect()
             vm_status = "up" if ssh.is_alive() else "down"
         vm_latency = round((time.time() - t0) * 1000)
+
+        vm_host = ssh.host
+        vm_port = ssh.port
+        vm_username = ssh.username
     except Exception:
         vm_status = "down"
+
+    host_display = f"{vm_host}:{vm_port}" if vm_port and vm_port != 22 else vm_host
+    description = "麒麟VM Agent 执行节点"
+    if vm_server_name:
+        description = f"{vm_server_name} · 麒麟VM Agent 执行节点"
 
     # 检查数据库连通性
     db_status = "up"
@@ -47,9 +84,12 @@ async def health():
                 "llmApi": {"status": "up", "latencyMs": None},
                 "vmAgent": {
                     "status": vm_status,
-                    "host": "192.168.163.15",
+                    "host": host_display,
+                    "port": vm_port,
+                    "username": vm_username,
+                    "serverName": vm_server_name,
                     "latencyMs": vm_latency,
-                    "description": "麒麟VM Agent 执行节点",
+                    "description": description,
                 },
             },
         },
@@ -65,6 +105,7 @@ async def get_config(user: dict = Depends(get_current_user)):
                 "model": settings.llm_model, "apiBase": settings.llm_api_base,
                 "apiKey": settings.llm_api_key,
                 "temperature": settings.llm_temperature, "maxTokens": settings.llm_max_tokens,
+                "systemRoleSupport": settings.llm_system_role_support,
             },
             "tool": {
                 "defaultTimeout": settings.tool_default_timeout,
@@ -84,8 +125,15 @@ async def get_config(user: dict = Depends(get_current_user)):
 
 @router.put("/config")
 async def update_config(payload: dict = Body(...), user: dict = Depends(get_current_user)):
-    if user.get("role") != "admin":
+    is_admin = user.get("role") == "admin"
+    has_llm = bool(payload.get("llm"))
+    has_security = bool(payload.get("security"))
+
+    if has_security and not is_admin:
         raise HTTPException(status_code=403, detail="仅管理员可修改安全配置")
+    if not is_admin and not has_llm:
+        raise HTTPException(status_code=403, detail="仅管理员可修改系统配置")
+
     changed = []
     env_updates = {}
 
@@ -96,6 +144,15 @@ async def update_config(payload: dict = Body(...), user: dict = Depends(get_curr
         "apiBase": "LLM_API_BASE",
         "temperature": "LLM_TEMPERATURE",
         "maxTokens": "LLM_MAX_TOKENS",
+        "systemRoleSupport": "LLM_SYSTEM_ROLE_SUPPORT",
+    }
+    llm_attr_map = {
+        "apiKey": "llm_api_key",
+        "model": "llm_model",
+        "apiBase": "llm_api_base",
+        "temperature": "llm_temperature",
+        "maxTokens": "llm_max_tokens",
+        "systemRoleSupport": "llm_system_role_support",
     }
     if payload.get("llm"):
         for k, v in payload["llm"].items():
@@ -103,18 +160,20 @@ async def update_config(payload: dict = Body(...), user: dict = Depends(get_curr
             if env_key:
                 env_updates[env_key] = str(v)
                 changed.append(f"llm.{k}")
-            attr = f"llm_{k}"
-            if hasattr(settings, attr):
+            attr = llm_attr_map.get(k)
+            if attr and hasattr(settings, attr):
                 setattr(settings, attr, v)
 
-    if payload.get("security"):
+    if payload.get("security") and is_admin:
         for k, v in payload["security"].items():
             if k == "approvalTimeout":
                 env_updates["APPROVAL_TIMEOUT"] = str(v)
+                settings.approval_timeout = int(v)
                 changed.append(f"security.{k}")
-            elif k == "maxConversationRounds":
+            elif k in ("maxConversationRounds", "maxRounds"):
                 env_updates["MAX_CONVERSATION_ROUNDS"] = str(v)
-                changed.append(f"security.{k}")
+                settings.max_conversation_rounds = int(v)
+                changed.append("security.maxConversationRounds")
 
     # 写回 .env 文件
     if env_updates:

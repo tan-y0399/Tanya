@@ -13,7 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.services.intent_classifier import IntentType, classify as classify_intent, get_intent_metadata
-from app.services.tool_definitions import TOOLS, SYSTEM_PROMPT
+from app.services.tool_definitions import (
+    TOOLS, SYSTEM_PROMPT, KNOWLEDGE_SYSTEM_PROMPT, OUT_OF_SCOPE_PROMPT,
+)
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -43,13 +45,13 @@ class BaseHandler:
     ) -> AsyncGenerator[dict, None]:
         raise NotImplementedError
 
-    async def _stream_llm(self, messages_chat: List[Dict]):
-        """调用 LLM 流式接口，yield SSE token 事件，最后 yield {'__stream_done__': True, 'content': ..., 'tool_calls': [...]}"""
+    async def _stream_llm(self, messages_chat: List[Dict], use_tools: bool = False):
+        """调用 LLM 流式接口；知识/闲聊路径必须 use_tools=False。"""
         from app.services.chat_service import call_deepseek
         current_tool_calls = []
         current_content = ""
 
-        async for chunk in call_deepseek(messages_chat, stream=True):
+        async for chunk in call_deepseek(messages_chat, stream=True, use_tools=use_tools):
             choice = chunk.get("choices", [{}])[0]
             delta = choice.get("delta", {})
 
@@ -81,26 +83,35 @@ class BaseHandler:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    async def _save_audit(self, db, trace_id, session_id, user_id, content, full_response, tool_records):
+    async def _save_audit(
+        self,
+        db,
+        trace_id,
+        session_id,
+        user_id,
+        content,
+        full_response,
+        tool_records,
+        intent_result=None,
+        telemetry=None,
+    ):
         try:
-            from app.models.audit import AuditRecord
-            tools_used = list(set(tc["toolName"] for tc in tool_records)) if tool_records else []
-            risks = [tc.get("riskLevel", "L1") for tc in tool_records] if tool_records else ["L1"]
-            max_risk = "L4" if "L4" in risks else ("L3" if "L3" in risks else ("L2" if "L2" in risks else "L1"))
-            audit = AuditRecord(
-                trace_id=trace_id, session_id=session_id, user_id=user_id,
-                event_type="chat",
-                summary=content[:100] if not tools_used else f"调用 {','.join(tools_used)} | {content[:60]}",
-                risk_level=max_risk,
-                detail_json=json.dumps({
-                    "intent": self.intent_type.value,
-                    "question": content[:200], "answer": full_response[:300] if full_response else "",
-                    "tools": [{"name": tc["toolName"], "status": tc.get("status"), "risk": tc.get("riskLevel")}
-                              for tc in (tool_records or [])],
-                }, ensure_ascii=False),
+            from app.services.audit_service import upsert_chat_audit_record
+            intent = (intent_result or {}).get("intent") or self.intent_type.value
+            conf = float((intent_result or {}).get("confidence", 0) or 0)
+            await upsert_chat_audit_record(
+                db,
+                trace_id=trace_id,
+                session_id=session_id,
+                user_id=user_id,
+                question=content,
+                answer=full_response or "",
+                tool_call_records=tool_records or [],
+                telemetry=telemetry,
+                intent=intent,
+                intent_confidence=conf or None,
+                flow_status="completed",
             )
-            db.add(audit)
-            await db.commit()
         except Exception:
             pass
 
@@ -115,7 +126,35 @@ class GeneralChatHandler(BaseHandler):
                      assistant_msg_id="", intent_result=None, rag_context="", **ctx):
         from app.services.chat_service import save_message
 
-        system_msg = {"role": "system", "content": SYSTEM_PROMPT}
+        intent_result = intent_result or {}
+        from app.services.ops_scope import (
+            is_service_control_request,
+            is_disk_cleanup_execution_request,
+            react_execution_redirect_message,
+            response_claims_fake_execution,
+        )
+        redirect = react_execution_redirect_message(content)
+        if redirect and (is_service_control_request(content) or is_disk_cleanup_execution_request(content)):
+            yield _sse("message_start", {"messageId": assistant_msg_id, "traceId": trace_id})
+            yield _sse("token", {"token": redirect, "phase": "answer"})
+            await save_message(db, session_id, "assistant", redirect, trace_id=trace_id)
+            yield _sse("message_done", {
+                "messageId": assistant_msg_id, "traceId": trace_id, "status": "redirect_react",
+            })
+            return
+
+        if intent_result.get("out_of_scope"):
+            from app.services.ops_scope import build_out_of_scope_refusal
+            yield _sse("message_start", {"messageId": assistant_msg_id, "traceId": trace_id})
+            refusal = build_out_of_scope_refusal()
+            yield _sse("token", {"token": refusal, "phase": "answer"})
+            await save_message(db, session_id, "assistant", refusal, trace_id=trace_id)
+            yield _sse("message_done", {"messageId": assistant_msg_id, "traceId": trace_id, "status": "out_of_scope"})
+            return
+
+        from app.services.agent_intent_context import build_intent_system_addon
+        system_msg = {"role": "system", "content": SYSTEM_PROMPT + build_intent_system_addon(
+            intent_result or {"intent": self.intent_type.value}, content)}
         chat_messages = [system_msg] + [
             {"role": m["role"], "content": m["content"]}
             for m in messages if m["role"] in ("user", "assistant")
@@ -124,14 +163,22 @@ class GeneralChatHandler(BaseHandler):
         yield _sse("message_start", {"messageId": assistant_msg_id, "traceId": trace_id})
 
         full_response = ""
-        async for event in self._stream_llm(chat_messages):
+        async for event in self._stream_llm(chat_messages, use_tools=False):
             if isinstance(event, dict) and event.get("__stream_done__"):
                 full_response = event.get("content", "") or ""
                 break
             yield event
 
+        if response_claims_fake_execution(full_response):
+            full_response = (
+                "⚠️ **说明**：上述清理操作尚未在服务器上执行（当前为普通问答模式，未调用 SSH 工具）。\n\n"
+                + react_execution_redirect_message(content)
+                + "\n\n请重新发送您的清理需求，系统将自动转入运维执行链路，"
+                "并按 L2/L3 确认或 L4 审批后才会真正运行命令。"
+            )
+
         await save_message(db, session_id, "assistant", full_response, trace_id=trace_id)
-        await self._save_audit(db, trace_id, session_id, user_id, content, full_response, [])
+        await self._save_audit(db, trace_id, session_id, user_id, content, full_response, [], intent_result=intent_result, telemetry=ctx.get("telemetry"))
 
         yield _sse("message_done", {"messageId": assistant_msg_id, "traceId": trace_id,
                                      "status": "completed", "usage": {"outputTokens": len(full_response)}})
@@ -146,6 +193,22 @@ class KnowledgeQAHandler(BaseHandler):
     async def handle(self, db, session_id, content, user_id, messages, trace_id="",
                      assistant_msg_id="", intent_result=None, rag_context="", **ctx):
         from app.services.chat_service import save_message
+        from app.services.ops_scope import (
+            is_disk_cleanup_execution_request,
+            is_service_control_request,
+            react_execution_redirect_message,
+            response_claims_fake_execution,
+        )
+
+        redirect = react_execution_redirect_message(content)
+        if redirect and (is_service_control_request(content) or is_disk_cleanup_execution_request(content)):
+            yield _sse("message_start", {"messageId": assistant_msg_id, "traceId": trace_id})
+            yield _sse("token", {"token": redirect, "phase": "answer"})
+            await save_message(db, session_id, "assistant", redirect, trace_id=trace_id)
+            yield _sse("message_done", {
+                "messageId": assistant_msg_id, "traceId": trace_id, "status": "redirect_react",
+            })
+            return
 
         # 构建 RAG 上下文
         if not rag_context:
@@ -164,26 +227,56 @@ class KnowledgeQAHandler(BaseHandler):
             except Exception as e:
                 logger.warning(f"RAG failed: {e}")
 
-        system_prompt = SYSTEM_PROMPT + "\n\n" + (rag_context or "")
+        from app.services.agent_intent_context import build_intent_system_addon
+        system_prompt = KNOWLEDGE_SYSTEM_PROMPT + build_intent_system_addon(
+            intent_result or {"intent": self.intent_type.value}, content)
+        rag_sources = []
+        if rag_context:
+            try:
+                from app.services.knowledge_rag import knowledge_rag
+                rag_sources = [s.get("title", "") for s in knowledge_rag.search(content, top_k=3)]
+            except Exception:
+                pass
+            system_prompt += "\n\n## 知识库参考\n" + rag_context
+            system_prompt += (
+                "\n\n**回答要求**：必须在文末列出「参考来源」并标注知识库条目；"
+                "不得编造知识库中不存在的具体命令参数或版本号；无依据处请明确说明为通用实践。"
+            )
+        else:
+            system_prompt += (
+                "\n\n（知识库暂无匹配条目，请基于麒麟 V11 / Linux 运维通用最佳实践作答，"
+                "仍须分步骤说明，勿调用工具；勿声称已执行任何命令。）"
+            )
         chat_messages = [{"role": "system", "content": system_prompt}] + [
             {"role": m["role"], "content": m["content"]}
             for m in messages if m["role"] in ("user", "assistant")
         ]
 
         yield _sse("message_start", {"messageId": assistant_msg_id, "traceId": trace_id})
+        yield _sse("response_phase", {"phase": "answer", "message": "正在组织运维知识回答…"})
 
         full_response = ""
-        async for event in self._stream_llm(chat_messages):
+        async for event in self._stream_llm(chat_messages, use_tools=False):
             if isinstance(event, dict) and event.get("__stream_done__"):
                 full_response = event.get("content", "") or ""
+                if event.get("tool_calls"):
+                    logger.warning("knowledge_qa received tool_calls, ignored")
                 break
             yield event
 
+        if response_claims_fake_execution(full_response):
+            full_response = (
+                "⚠️ **说明**：清理/删除类命令尚未在服务器上执行（知识问答模式不会调用 SSH）。\n\n"
+                + react_execution_redirect_message(content)
+                + "\n\n请重新发送执行类请求，系统将逐条调用 `execute_command`，"
+                "L2/L3 需您在对话页确认，L4 需管理员审批通过后再执行。"
+            )
+
         await save_message(db, session_id, "assistant", full_response, trace_id=trace_id)
-        await self._save_audit(db, trace_id, session_id, user_id, content, full_response, [])
+        await self._save_audit(db, trace_id, session_id, user_id, content, full_response, [], intent_result=intent_result, telemetry=ctx.get("telemetry"))
 
         yield _sse("message_done", {"messageId": assistant_msg_id, "traceId": trace_id,
-                                     "status": "completed"})
+                                     "status": "completed", "mode": "knowledge"})
 
 
 # ═══════════════════════════════════════════
@@ -293,7 +386,7 @@ class OpsQueryHandler(BaseHandler):
         await save_message(db, session_id, "assistant", full_response, trace_id=trace_id)
         if tool_call_records:
             await save_message(db, session_id, "tool_call", "", tool_calls=tool_call_records, trace_id=trace_id)
-        await self._save_audit(db, trace_id, session_id, user_id, content, full_response, tool_call_records)
+        await self._save_audit(db, trace_id, session_id, user_id, content, full_response, tool_call_records, intent_result=intent_result, telemetry=ctx.get("telemetry"))
 
         yield _sse("message_done", {"messageId": assistant_msg_id, "traceId": trace_id,
                                      "status": "completed"})
@@ -476,7 +569,7 @@ class FaultAnalysisHandler(BaseHandler):
         await save_message(db, session_id, "assistant", full_response, trace_id=trace_id)
         if tool_call_records:
             await save_message(db, session_id, "tool_call", "", tool_calls=tool_call_records, trace_id=trace_id)
-        await self._save_audit(db, trace_id, session_id, user_id, content, full_response, tool_call_records)
+        await self._save_audit(db, trace_id, session_id, user_id, content, full_response, tool_call_records, intent_result=intent_result, telemetry=ctx.get("telemetry"))
 
         yield _sse("message_done", {"messageId": assistant_msg_id, "traceId": trace_id,
                                      "status": "completed"})
@@ -521,7 +614,7 @@ class HighRiskHandler(BaseHandler):
             full_response = result[0] or ""
 
         await save_message(db, session_id, "assistant", full_response, trace_id=trace_id)
-        await self._save_audit(db, trace_id, session_id, user_id, content, full_response, [])
+        await self._save_audit(db, trace_id, session_id, user_id, content, full_response, [], intent_result=intent_result, telemetry=ctx.get("telemetry"))
 
         yield _sse("message_done", {"messageId": assistant_msg_id, "traceId": trace_id,
                                      "status": "completed", "usage": {"outputTokens": len(full_response)}})
@@ -546,7 +639,7 @@ class InjectionBlockHandler(BaseHandler):
         })
 
         await save_message(db, session_id, "assistant", f"⚠ {block_msg}", trace_id=trace_id)
-        await self._save_audit(db, trace_id, session_id, user_id, content, "", [])
+        await self._save_audit(db, trace_id, session_id, user_id, content, "", [], intent_result=intent_result, telemetry=ctx.get("telemetry"))
 
         yield _sse("message_done", {"messageId": assistant_msg_id, "traceId": trace_id,
                                      "status": "blocked_injection"})

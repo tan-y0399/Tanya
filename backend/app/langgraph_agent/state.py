@@ -21,13 +21,21 @@ class RiskLevel(str, Enum):
 class AgentStage(str, Enum):
     INIT = "init"
     INTENT_FILTER = "intent_filter"
+    SECURITY_RECHECK = "security_recheck"
     PARALLEL_PROCESS = "parallel_process"
     FUSION = "fusion"
+    ROUTE_DISPATCH = "route_dispatch"
+    DIAGNOSTIC_PLAN = "diagnostic_plan"
+    ENV_PRECHECK = "env_precheck"
     DIALOG_MANAGE = "dialog_manage"
     REASONING = "reasoning"
     SAFETY_CHECK = "safety_check"
+    CONFIRMATION = "confirmation"
     TOOL_EXECUTION = "tool_execution"
+    FACT_CHECK = "fact_check"
     RESPONSE_ASSEMBLY = "response_assembly"
+    KB_INGEST = "kb_ingest"
+    ROLLBACK = "rollback"
     FALLBACK = "fallback"
     COMPLETED = "completed"
 
@@ -53,8 +61,13 @@ class AgentState(TypedDict):
     # 输入
     user_input: str
     user_id: str
+    user_role: str
     session_id: str
     trace_id: str
+    confirm_plan_id: Optional[str]
+    server_id: Optional[str]
+    client_ip: Optional[str]
+    sanitized_input: Optional[str]
 
     # 意图风险过滤
     intent: Optional[str]
@@ -109,6 +122,27 @@ class AgentState(TypedDict):
     risk_color: str
     state_cards: List[Dict]
     reasoning_chain_visible: bool
+
+    # 人类监督扩展（分阶段流程）
+    security_gate_details: Optional[Dict]
+    recheck_passed: bool
+    route_path: Optional[str]
+    workflow_link: Optional[str]
+    diagnostic_plan: Optional[Dict]
+    plan_id: Optional[str]
+    plan_confirmed: bool
+    env_precheck: Optional[Dict]
+    snapshot_id: Optional[str]
+    checkpoint_id: Optional[str]
+    file_protection_whitelist: Optional[List[str]]
+    current_plan_step: int
+    fact_check_passed: Optional[bool]
+    fact_check_notes: Optional[str]
+    execution_command_log: List[Dict]
+    ops_report: Optional[str]
+    final_status: str
+    awaiting_user_action: bool
+    kb_article_id: Optional[str]
 
     # 元数据
     current_stage: AgentStage

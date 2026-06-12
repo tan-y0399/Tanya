@@ -9,8 +9,31 @@ from sqlalchemy import select, func, or_, delete as sql_delete
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.knowledge import KnowledgeArticle
+from app.services.knowledge_engagement import (
+    ensure_knowledge_schema,
+    get_user_engagements,
+    toggle_like,
+    toggle_favorite,
+)
 
 router = APIRouter(prefix="/knowledge", tags=["知识库"])
+
+
+def _article_item(r: KnowledgeArticle, engagement: dict | None = None) -> dict:
+    item = {
+        "id": r.id, "title": r.title, "category": r.category,
+        "tags": r.tags.split(",") if r.tags else [],
+        "content": r.content, "source": r.source, "severity": r.severity,
+        "viewCount": r.view_count or 0,
+        "likeCount": getattr(r, "like_count", 0) or 0,
+        "favoriteCount": getattr(r, "favorite_count", 0) or 0,
+        "createdAt": r.created_at.isoformat() if r.created_at else "",
+        "updatedAt": r.updated_at.isoformat() if r.updated_at else "",
+    }
+    if engagement is not None:
+        item["liked"] = engagement.get("liked", False)
+        item["favorited"] = engagement.get("favorited", False)
+    return item
 
 # 知识库文件路径（多级回退查找）
 def _resolve_kb_paths() -> dict:
@@ -347,9 +370,11 @@ def _determine_severity(title: str, content: str) -> str:
 async def list_articles(
     page: int = 1, size: int = 20,
     category: str = "", keyword: str = "",
+    sort: str = "", tags: str = "",
+    userKey: str = "",
     db: AsyncSession = Depends(get_db),
 ):
-    q = select(KnowledgeArticle).order_by(KnowledgeArticle.updated_at.desc())
+    q = select(KnowledgeArticle)
     conditions = []
     if category:
         conditions.append(KnowledgeArticle.category == category)
@@ -359,8 +384,20 @@ async def list_articles(
             KnowledgeArticle.content.contains(keyword),
             KnowledgeArticle.tags.contains(keyword),
         ))
+    if tags:
+        for tag in [t.strip() for t in tags.split(",") if t.strip()]:
+            conditions.append(KnowledgeArticle.tags.contains(tag))
     if conditions:
         q = q.where(*conditions)
+
+    if sort == "views":
+        q = q.order_by(KnowledgeArticle.view_count.desc(), KnowledgeArticle.updated_at.desc())
+    elif sort == "title":
+        q = q.order_by(KnowledgeArticle.title.asc())
+    elif sort == "likes":
+        q = q.order_by(KnowledgeArticle.like_count.desc(), KnowledgeArticle.updated_at.desc())
+    else:
+        q = q.order_by(KnowledgeArticle.updated_at.desc())
 
     total = (await db.execute(
         select(func.count()).select_from(KnowledgeArticle).where(*conditions) if conditions
@@ -369,37 +406,64 @@ async def list_articles(
 
     rows = (await db.execute(q.offset((page - 1) * size).limit(size))).scalars().all()
 
-    items = []
-    for r in rows:
-        items.append({
-            "id": r.id, "title": r.title, "category": r.category,
-            "tags": r.tags.split(",") if r.tags else [],
-            "content": r.content, "source": r.source, "severity": r.severity,
-            "viewCount": r.view_count,
-            "createdAt": r.created_at.isoformat() if r.created_at else "",
-            "updatedAt": r.updated_at.isoformat() if r.updated_at else "",
-        })
+    user_eng = {}
+    if userKey:
+        user_eng = await get_user_engagements(db, userKey, [r.id for r in rows])
+
+    items = [
+        _article_item(r, user_eng.get(r.id, {"liked": False, "favorited": False}) if userKey else None)
+        for r in rows
+    ]
 
     return {"code": 0, "data": {"items": items, "total": total, "page": page, "size": size}}
 
 
 @router.get("/articles/{article_id}")
-async def get_article(article_id: str, db: AsyncSession = Depends(get_db)):
+async def get_article(article_id: str, userKey: str = "", db: AsyncSession = Depends(get_db)):
     q = select(KnowledgeArticle).where(KnowledgeArticle.id == article_id)
     r = (await db.execute(q)).scalar_one_or_none()
     if not r:
         raise HTTPException(status_code=404, detail="文章不存在")
     r.view_count = (r.view_count or 0) + 1
     await db.commit()
-    return {
-        "code": 0, "data": {
-            "id": r.id, "title": r.title, "category": r.category,
-            "tags": r.tags.split(",") if r.tags else [],
-            "content": r.content, "source": r.source, "severity": r.severity,
-            "viewCount": r.view_count,
-            "createdAt": r.created_at.isoformat() if r.created_at else "",
-        },
-    }
+    await db.refresh(r)
+
+    engagement = None
+    if userKey:
+        user_eng = await get_user_engagements(db, userKey, [article_id])
+        engagement = user_eng.get(article_id)
+
+    return {"code": 0, "data": _article_item(r, engagement)}
+
+
+@router.get("/engagement")
+async def list_engagement(userKey: str = "", db: AsyncSession = Depends(get_db)):
+    if not userKey:
+        return {"code": 0, "data": {}}
+    data = await get_user_engagements(db, userKey)
+    return {"code": 0, "data": data}
+
+
+@router.post("/articles/{article_id}/like")
+async def like_article(article_id: str, req: dict = Body(default={}), db: AsyncSession = Depends(get_db)):
+    user_key = (req.get("userKey") or "").strip()
+    if not user_key:
+        raise HTTPException(status_code=400, detail="缺少 userKey")
+    data = await toggle_like(db, article_id, user_key)
+    if not data:
+        raise HTTPException(status_code=404, detail="文章不存在")
+    return {"code": 0, "data": data}
+
+
+@router.post("/articles/{article_id}/favorite")
+async def favorite_article(article_id: str, req: dict = Body(default={}), db: AsyncSession = Depends(get_db)):
+    user_key = (req.get("userKey") or "").strip()
+    if not user_key:
+        raise HTTPException(status_code=400, detail="缺少 userKey")
+    data = await toggle_favorite(db, article_id, user_key)
+    if not data:
+        raise HTTPException(status_code=404, detail="文章不存在")
+    return {"code": 0, "data": data}
 
 
 @router.get("/categories")

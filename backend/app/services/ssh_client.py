@@ -14,7 +14,33 @@ from typing import Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
+def _load_private_key(key_path: str):
+    """自动检测并加载私钥文件（支持 RSA、Ed25519、ECDSA 等格式）"""
+    if not os.path.isfile(key_path):
+        raise FileNotFoundError(f"私钥文件不存在: {key_path}")
+
+    # paramiko >= 3.4 推荐用 PKey.from_path，避免各版本 Key 类名差异
+    from_path = getattr(paramiko.PKey, "from_path", None)
+    if callable(from_path):
+        try:
+            return from_path(key_path)
+        except (ValueError, paramiko.SSHException, OSError):
+            pass
+
+    key_class_names = ("RSAKey", "Ed25519Key", "ECDSAKey", "DSSKey")
+    for name in key_class_names:
+        key_cls = getattr(paramiko, name, None)
+        if key_cls is None:
+            continue
+        try:
+            return key_cls.from_private_key_file(key_path)
+        except (ValueError, paramiko.SSHException, OSError):
+            continue
+    raise ValueError(f"无法识别的密钥格式: {key_path}（已尝试 RSA/Ed25519/ECDSA）")
+
+
 from app.core.config import settings as _settings
+from app.services.server_user_policy import assert_allowed_ssh_user
 
 # 最大重试次数
 MAX_RETRIES = 2
@@ -47,11 +73,12 @@ class SSHClient:
 
     def connect(self) -> None:
         """建立 SSH 连接，启用 keepalive 防止空闲断开。"""
+        self.username = assert_allowed_ssh_user(self.username)
         self._client = paramiko.SSHClient()
         self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
             key_path = os.path.expanduser(self.key_path)
-            key = paramiko.RSAKey.from_private_key_file(key_path)
+            key = _load_private_key(key_path)
             self._client.connect(
                 hostname=self.host,
                 port=self.port,
@@ -139,6 +166,7 @@ class SSHPool:
         """获取或创建指定服务器的 SSH 连接"""
         key = server_id
         if key not in self._clients:
+            username = assert_allowed_ssh_user(username)
             client = SSHClient(host=host, port=port, username=username, key_path=key_path)
             client.connect()
             self._clients[key] = client

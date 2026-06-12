@@ -73,6 +73,47 @@ async def add_tool(
     return {"code": 0, "data": _serialize_tool(tool), "message": "工具添加成功"}
 
 
+@router.put("/batch")
+async def batch_update_tools(
+    payload: dict = Body(...),
+    user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """批量更新工具启用状态 — 供系统设置保存时使用"""
+    updates = payload.get("updates") or []
+    if not isinstance(updates, list) or not updates:
+        raise HTTPException(status_code=400, detail="updates 不能为空")
+
+    ids = [u.get("id") for u in updates if u.get("id")]
+    if not ids:
+        raise HTTPException(status_code=400, detail="updates 缺少有效 id")
+
+    result = await db.execute(select(ToolConfig).where(ToolConfig.id.in_(ids)))
+    tools_by_id = {t.id: t for t in result.scalars().all()}
+
+    updated = []
+    for item in updates:
+        tool_id = item.get("id")
+        if not tool_id or tool_id not in tools_by_id:
+            continue
+        if "enabled" in item:
+            tools_by_id[tool_id].enabled = 1 if item["enabled"] else 0
+            updated.append(tool_id)
+
+    if not updated:
+        raise HTTPException(status_code=400, detail="没有可更新的工具")
+
+    await db.commit()
+    for tool_id in updated:
+        await db.refresh(tools_by_id[tool_id])
+
+    return {
+        "code": 0,
+        "message": f"已更新 {len(updated)} 个工具",
+        "data": {"items": [_serialize_tool(tools_by_id[tid]) for tid in updated]},
+    }
+
+
 @router.put("/{tool_id}")
 async def update_tool(
     tool_id: str,

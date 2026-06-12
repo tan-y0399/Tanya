@@ -16,7 +16,7 @@ class Server(Base):
     name = Column(String(64), nullable=False)
     host = Column(String(128), nullable=False)
     port = Column(Integer, default=22)
-    username = Column(String(64), default="root")
+    username = Column(String(64), default="ty")
     key_path = Column(String(256), default="~/.ssh/id_rsa")
     description = Column(String(256), default="")
     tags = Column(String(256), default="")  # 逗号分隔标签，如 "web,db,prod"

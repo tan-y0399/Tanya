@@ -1,7 +1,8 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime, Text, Boolean
+from sqlalchemy import Column, String, DateTime, Boolean
 from app.core.database import Base
+from app.models.json_type import JSONType
 
 
 def gen_id() -> str:
@@ -19,10 +20,10 @@ class PendingExecution(Base):
     approval_id = Column(String(24), nullable=True, index=True)
 
     tool_name = Column(String(128), nullable=False)
-    tool_params_json = Column(Text, nullable=True)
+    tool_params_json = Column(JSONType, nullable=True)
     risk_level = Column(String(4), nullable=False)
 
-    messages_snapshot_json = Column(Text, nullable=True)
+    messages_snapshot_json = Column(JSONType, nullable=True)
 
     need_confirm = Column(Boolean, default=False)
     need_approval = Column(Boolean, default=False)

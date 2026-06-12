@@ -1,119 +1,283 @@
 <template>
   <div class="approval-page">
-    <div class="page-header">
-      <h2 class="page-title">审批管理</h2>
-      <p class="page-desc">高危运维操作人工审批，超时自动拒绝</p>
-    </div>
+    <header class="page-header">
+      <div class="header-main">
+        <span class="page-tag">APPROVAL</span>
+        <h2 class="page-title">审批管理</h2>
+        <p class="page-desc">L4/L5 高危运维操作的人工审批闸门 · 超时自动拒绝 · 全链路可追溯</p>
+      </div>
+      <div v-if="isAdmin" class="role-badge admin">管理员模式</div>
+      <div v-else class="role-badge user">仅可查看 · 审批需管理员</div>
+    </header>
 
-    <!-- 最近执行结果 -->
-    <div class="execution-result" v-if="lastExecutionResult">
+    <ApprovalModuleHub />
+
+    <section class="stats-grid">
+      <div
+        v-for="card in statCards"
+        :key="card.key"
+        class="stat-card"
+        :style="{ '--card-accent': statAccent(card.tone) }"
+      >
+        <div class="card-glow" aria-hidden="true"></div>
+        <span class="stat-code">{{ card.key.toUpperCase() }}</span>
+        <span class="stat-label">{{ card.label }}</span>
+        <strong class="stat-value">{{ card.value }}</strong>
+        <span class="stat-hint">{{ card.hint }}</span>
+      </div>
+    </section>
+
+    <div v-if="lastExecutionResult" class="execution-result">
       <div class="exec-head">
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-          <circle cx="8" cy="8" r="7" :stroke="lastExecutionResult.success ? '#059669' : '#dc2626'" stroke-width="1.3"/>
-          <path :d="lastExecutionResult.success ? 'M5 8l2 2 4-4' : 'M5.5 5.5l5 5M10.5 5.5l-5 5'" :stroke="lastExecutionResult.success ? '#059669' : '#dc2626'" stroke-width="1.5" stroke-linecap="round"/>
-        </svg>
         <span :class="lastExecutionResult.success ? 'text-green' : 'text-red'">
-          {{ lastExecutionResult.success ? '命令已执行成功' : '命令执行失败' }}
+          {{ lastExecutionResult.success ? '✓ 命令已执行成功' : '✕ 命令执行失败' }}
         </span>
         <button class="exec-close" @click="lastExecutionResult = null">&times;</button>
       </div>
-      <pre class="exec-output" v-if="lastExecutionResult.result">{{ JSON.stringify(lastExecutionResult.result, null, 2) }}</pre>
+      <pre v-if="lastExecutionResult.result" class="exec-output">{{ JSON.stringify(lastExecutionResult.result, null, 2) }}</pre>
     </div>
 
     <div class="tabs-row">
       <button class="tab-btn" :class="{ active: tab === 'pending' }" @click="tab = 'pending'">
+        <span class="tab-icon">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+            <circle cx="12" cy="12" r="8" stroke="currentColor" stroke-width="1.8" />
+            <path d="M12 7v5l3 2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+          </svg>
+        </span>
         待审批
-        <span class="tab-badge" v-if="pendingTotal">{{ pendingTotal }}</span>
+        <span v-if="pendingTotal" class="tab-badge">{{ pendingTotal }}</span>
       </button>
       <button class="tab-btn" :class="{ active: tab === 'history' }" @click="tab = 'history'">
+        <span class="tab-icon">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+            <path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+          </svg>
+        </span>
         审批历史
       </button>
     </div>
 
-    <!-- 待审批 -->
-    <div v-if="tab === 'pending'">
-      <div class="approval-card card" v-for="ap in pendingItems" :key="ap.id">
-        <div class="card-left">
-          <div class="card-head">
-            <span class="card-tool">{{ ap.toolName }}</span>
-            <span class="risk-tag" :class="`l${ap.riskLevel || 'L3'}`">{{ ap.riskLevel }}</span>
-          </div>
-          <div class="card-detail">{{ ap.detail }}</div>
-          <div class="card-meta">
-            <span>申请人: {{ ap.requestedBy }}</span>
-            <span>{{ formatTime(ap.requestedAt) }}</span>
-            <span class="expire" v-if="ap.expiresAt">过期: {{ formatTime(ap.expiresAt) }}</span>
-          </div>
-          <div class="card-params" v-if="ap.toolParams">
-            <div class="params-label">操作参数</div>
-            <pre class="code-mini">{{ JSON.stringify(ap.toolParams, null, 2) }}</pre>
-          </div>
-        </div>
-        <div class="card-actions" v-if="isAdmin">
-          <button class="act-btn approve" @click="handleApprove(ap.id)" :disabled="approving === ap.id">
-            <svg v-if="approving !== ap.id" width="16" height="16" viewBox="0 0 16 16" fill="none">
-              <path d="M3 8l3 3 7-7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-            </svg>
-            <span v-else class="btn-spinner"></span>
-            {{ approving === ap.id ? '执行中...' : '通过' }}
-          </button>
-          <button class="act-btn reject" @click="handleReject(ap.id)" :disabled="approving === ap.id">
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-              <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-            </svg>
-            拒绝
-          </button>
-        </div>
-        <div class="card-actions" v-else>
-          <div class="no-permission-tip">仅管理员可审批</div>
+    <section class="content-panel">
+      <div class="section-head">
+        <div>
+          <h3 class="section-title">{{ tab === 'pending' ? '待审批队列' : '审批历史记录' }}</h3>
+          <p class="section-tip">
+            <template v-if="tab === 'pending'">
+              共 {{ pendingTotal }} 条待处理 · 管理员需在 120 秒内完成决策
+            </template>
+            <template v-else>
+              共 {{ historyTotal }} 条历史记录 · 点击卡片查看详情
+            </template>
+          </p>
         </div>
       </div>
-      <div class="empty-state" v-if="!pendingItems.length">
-        <p>暂无待审批操作</p>
-      </div>
-    </div>
 
-    <!-- 审批历史 -->
-    <div class="card" v-if="tab === 'history'">
-      <el-table :data="historyItems" size="default" header-row-class-name="tech-table-header" row-class-name="tech-table-row">
-        <el-table-column prop="toolName" label="工具" min-width="140"/>
-        <el-table-column label="风险" width="80">
-          <template #default="{ row }">
-            <span class="risk-tag" :class="`l${row.riskLevel || 'L3'}`">{{ row.riskLevel }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column prop="requestedBy" label="申请人" width="100"/>
-        <el-table-column label="结果" width="80">
-          <template #default="{ row }">
-            <span :class="row.result === 'APPROVED' ? 'ok' : 'fail'">
-              {{ row.result === 'APPROVED' ? '已通过' : '已拒绝' }}
+      <div v-if="tab === 'pending'" class="flow-list">
+        <ApprovalFlowCard
+          v-for="ap in pendingItems"
+          :key="ap.id"
+          :item="ap"
+          mode="pending"
+          :is-admin="isAdmin"
+          :approving="approving === ap.id"
+          @open="openDetail"
+          @detail="openDetail"
+          @approve="handleApprove"
+          @reject="handleReject"
+          @goto-chat="gotoChat"
+        />
+        <div v-if="!pendingItems.length" class="empty-state">
+          <div class="empty-icon">✓</div>
+          <p>暂无待审批操作</p>
+          <span class="empty-hint">Agent 发起 L4/L5 高危命令时会在此等待审批</span>
+        </div>
+      </div>
+
+      <div v-else class="flow-list">
+        <ApprovalFlowCard
+          v-for="row in historyItems"
+          :key="row.id"
+          :item="row"
+          mode="history"
+          :is-admin="isAdmin"
+          @open="openDetail"
+          @detail="openDetail"
+          @goto-chat="gotoChat"
+          @action="handleRowAction"
+        />
+        <div v-if="!historyItems.length" class="empty-state">
+          <p>暂无审批历史</p>
+        </div>
+        <div v-if="historyTotal > historyPageSize" class="pagination-row">
+          <el-pagination
+            :current-page="historyPage"
+            :page-size="historyPageSize"
+            :total="historyTotal"
+            layout="prev, pager, next"
+            background
+            @update:current-page="onHistoryPage"
+          />
+        </div>
+      </div>
+    </section>
+
+    <ApprovalDetailDrawer
+      v-model:visible="detailVisible"
+      :approval-id="selectedId"
+      @goto-chat="gotoChat"
+    />
+
+    <el-dialog
+      v-model="editVisible"
+      title="修改审批记录"
+      width="480px"
+      :close-on-click-modal="false"
+      class="approval-edit-dialog"
+    >
+      <el-form v-if="editForm" label-position="top" class="edit-form">
+        <el-form-item label="风险等级">
+          <el-select v-model="editForm.riskLevel" style="width: 100%">
+            <el-option label="L3" value="L3" />
+            <el-option label="L4" value="L4" />
+            <el-option label="L5" value="L5" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="风险描述">
+          <el-input v-model="editForm.detail" type="textarea" :rows="3" maxlength="500" show-word-limit />
+        </el-form-item>
+        <el-form-item label="审批意见">
+          <el-input v-model="editForm.comment" type="textarea" :rows="3" maxlength="500" show-word-limit />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <button type="button" class="dialog-btn" @click="editVisible = false">取消</button>
+        <button type="button" class="dialog-btn primary" :disabled="saving" @click="saveEdit">
+          {{ saving ? '保存中…' : '保存' }}
+        </button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="deleteVisible"
+      width="440px"
+      :show-close="false"
+      :close-on-click-modal="false"
+      class="approval-delete-dialog"
+      align-center
+    >
+      <div class="delete-dialog-body">
+        <div class="delete-icon-wrap">
+          <svg viewBox="0 0 24 24" fill="none" class="delete-icon">
+            <path d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <h3 class="delete-title">确认删除审批记录</h3>
+        <p class="delete-desc">删除后无法恢复，关联的待执行状态也将一并清除。</p>
+
+        <div v-if="deleteTarget" class="delete-preview">
+          <div class="preview-head">
+            <span class="source-pill sm">{{ deleteTarget.sourceType || 'Agent 对话' }}</span>
+            <span class="result-pill" :class="approvalResultClass(deleteTarget.status)">
+              {{ approvalResultLabel(deleteTarget.status) }}
             </span>
-          </template>
-        </el-table-column>
-        <el-table-column label="时间" min-width="160">
-          <template #default="{ row }">{{ formatTime(row.requestedAt) }}</template>
-        </el-table-column>
-      </el-table>
-    </div>
+            <span class="risk-tag" :class="riskClass(deleteTarget.riskLevel)">{{ deleteTarget.riskLevel }}</span>
+          </div>
+          <p class="preview-event">{{ deleteTarget.eventSummary || deleteTarget.detail || deleteTarget.toolName }}</p>
+          <code v-if="deleteTarget.commandPreview" class="preview-cmd">{{ deleteTarget.commandPreview }}</code>
+          <div class="preview-meta">
+            <span>{{ formatUser(deleteTarget) }}</span>
+            <span>{{ formatTime(deleteTarget.resolvedAt || deleteTarget.requestedAt) }}</span>
+          </div>
+        </div>
+      </div>
+      <template #footer>
+        <div class="delete-footer">
+          <button type="button" class="dialog-btn" :disabled="deleting" @click="deleteVisible = false">取消</button>
+          <button type="button" class="dialog-btn danger" :disabled="deleting" @click="confirmDelete">
+            {{ deleting ? '删除中…' : '确认删除' }}
+          </button>
+        </div>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
-import { getPendingApprovals, getApprovalHistory, approveApproval, rejectApproval } from '@/api/approval'
+import ApprovalModuleHub from '@/components/approval/ApprovalModuleHub.vue'
+import ApprovalFlowCard from '@/components/approval/ApprovalFlowCard.vue'
+import ApprovalDetailDrawer from '@/components/approval/ApprovalDetailDrawer.vue'
+import {
+  approvalResultClass,
+  approvalResultLabel,
+  riskClass,
+  STAT_ACCENTS,
+} from '@/components/approval/approvalMeta'
+import {
+  getPendingApprovals,
+  getApprovalHistory,
+  getApprovalStats,
+  getApprovalById,
+  approveApproval,
+  rejectApproval,
+  updateApproval,
+  deleteApproval,
+} from '@/api/approval'
+import { getMessages } from '@/api/chat'
 import { formatTime } from '@/utils'
 import { ElMessage } from 'element-plus'
 
+const router = useRouter()
 const userStore = useUserStore()
 const isAdmin = computed(() => userStore.userInfo?.role === 'admin')
 
-const tab = ref<'pending' | 'history'>('pending')
+const tab = ref<'pending' | 'history'>('history')
 const pendingItems = ref<any[]>([])
 const pendingTotal = ref(0)
 const historyItems = ref<any[]>([])
+const historyTotal = ref(0)
+const historyPage = ref(1)
+const historyPageSize = 20
+const stats = ref<Record<string, number>>({})
 const lastExecutionResult = ref<any>(null)
 const approving = ref<string | null>(null)
+const detailVisible = ref(false)
+const selectedId = ref<string | null>(null)
+const editVisible = ref(false)
+const editForm = ref<{ id: string; detail: string; comment: string; riskLevel: string } | null>(null)
+const saving = ref(false)
+const deleteVisible = ref(false)
+const deleteTarget = ref<any>(null)
+const deleting = ref(false)
+
+const statCards = computed(() => [
+  { key: 'pending', label: '待审批', value: stats.value.pending ?? pendingTotal.value, hint: '需尽快处理', tone: 'tone-warn' },
+  { key: 'approved', label: '已通过', value: stats.value.approved ?? 0, hint: '累计', tone: 'tone-ok' },
+  { key: 'rejected', label: '已拒绝', value: stats.value.rejected ?? 0, hint: '累计', tone: 'tone-fail' },
+  { key: 'timeout', label: '已超时', value: stats.value.timeout ?? 0, hint: '累计', tone: 'tone-muted' },
+  { key: 'today', label: '今日申请', value: stats.value.today ?? 0, hint: '新发起', tone: 'tone-blue' },
+])
+
+function statAccent(tone: string) {
+  return STAT_ACCENTS[tone] || '#64748b'
+}
+
+function formatUser(row: any) {
+  const name = row.requestedBy || row.requestedByUsername
+  if (name && row.requestedByRole) return `${name}（${row.requestedByRole}）`
+  return name || '—'
+}
+
+async function loadStats() {
+  try {
+    stats.value = await getApprovalStats()
+  } catch {
+    stats.value = {}
+  }
+}
 
 async function loadPending() {
   try {
@@ -127,25 +291,111 @@ async function loadPending() {
 
 async function loadHistory() {
   try {
-    const data = await getApprovalHistory()
+    const data = await getApprovalHistory(historyPage.value, historyPageSize)
     historyItems.value = data.items || []
+    historyTotal.value = data.total || 0
   } catch {
     ElMessage.error('加载审批历史失败')
   }
+}
+
+function onHistoryPage(page: number) {
+  historyPage.value = page
+  loadHistory()
+}
+
+async function gotoChat(row: { sessionId?: string; traceId?: string }) {
+  if (!row.sessionId) return
+  try {
+    await getMessages(row.sessionId, 1, 1)
+  } catch {
+    ElMessage.warning('会话不存在或已被删除')
+    return
+  }
+  detailVisible.value = false
+  await router.push({
+    path: `/chat/${row.sessionId}`,
+    query: row.traceId ? { trace: row.traceId } : {},
+  })
+}
+
+function openDetail(row: { id: string }) {
+  selectedId.value = row.id
+  detailVisible.value = true
+}
+
+async function openEdit(row: { id: string }) {
+  try {
+    const data = await getApprovalById(row.id)
+    editForm.value = {
+      id: data.id,
+      detail: data.detail || '',
+      comment: data.comment || '',
+      riskLevel: data.riskLevel || 'L4',
+    }
+    editVisible.value = true
+  } catch {
+    ElMessage.error('加载审批详情失败')
+  }
+}
+
+async function saveEdit() {
+  if (!editForm.value) return
+  saving.value = true
+  try {
+    await updateApproval(editForm.value.id, {
+      detail: editForm.value.detail,
+      comment: editForm.value.comment,
+      riskLevel: editForm.value.riskLevel,
+    })
+    ElMessage.success('已保存')
+    editVisible.value = false
+    await refreshAll()
+  } catch (e: any) {
+    ElMessage.error('保存失败: ' + (e?.response?.data?.detail || e?.message || '操作失败'))
+  } finally {
+    saving.value = false
+  }
+}
+
+function openDelete(row: any) {
+  deleteTarget.value = row
+  deleteVisible.value = true
+}
+
+async function confirmDelete() {
+  if (!deleteTarget.value) return
+  deleting.value = true
+  try {
+    await deleteApproval(deleteTarget.value.id)
+    ElMessage.success('审批记录已删除')
+    deleteVisible.value = false
+    deleteTarget.value = null
+    await refreshAll()
+  } catch (e: any) {
+    ElMessage.error('删除失败: ' + (e?.response?.data?.detail || e?.message || '操作失败'))
+  } finally {
+    deleting.value = false
+  }
+}
+
+function handleRowAction(cmd: string, row: any) {
+  if (cmd === 'detail') openDetail(row)
+  else if (cmd === 'edit') openEdit(row)
+  else if (cmd === 'delete') openDelete(row)
 }
 
 async function handleApprove(id: string) {
   approving.value = id
   try {
     const res = await approveApproval(id, '确认执行')
-    ElMessage.success(res?.data?.message || res?.message || '审批通过')
-    await loadPending()
-    await loadHistory()
+    ElMessage.success(res?.data?.message || res?.message || '审批通过，请在对话页面确认执行')
+    await refreshAll()
   } catch (e: any) {
-    const detail = e?.response?.data?.detail || e?.message || '操作失败'
-    ElMessage.error('审批失败: ' + detail)
+    ElMessage.error('审批失败: ' + (e?.response?.data?.detail || e?.message || '操作失败'))
+  } finally {
+    approving.value = null
   }
-  finally { approving.value = null }
 }
 
 async function handleReject(id: string) {
@@ -153,27 +403,149 @@ async function handleReject(id: string) {
   try {
     const res = await rejectApproval(id, '不予执行')
     ElMessage.warning(res?.data?.message || res?.message || '已拒绝')
-    await loadPending()
-    await loadHistory()
+    await refreshAll()
   } catch (e: any) {
-    const detail = e?.response?.data?.detail || e?.message || '操作失败'
-    ElMessage.error('拒绝失败: ' + detail)
+    ElMessage.error('拒绝失败: ' + (e?.response?.data?.detail || e?.message || '操作失败'))
+  } finally {
+    approving.value = null
   }
-  finally { approving.value = null }
 }
 
-onMounted(() => { loadPending(); loadHistory() })
+async function refreshAll() {
+  await Promise.all([loadStats(), loadPending(), loadHistory()])
+}
+
+onMounted(refreshAll)
 </script>
 
 <style lang="scss" scoped>
-.approval-page { max-width: 900px; margin: 0 auto; }
+.approval-page {
+  max-width: 1100px;
+  margin: 0 auto;
+  position: relative;
+
+  &::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: -1;
+    background-image:
+      linear-gradient(rgba(124, 58, 237, 0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(124, 58, 237, 0.03) 1px, transparent 1px);
+    background-size: 32px 32px;
+    mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, #000 20%, transparent 75%);
+  }
+}
+
+.page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+  flex-wrap: wrap;
+}
+
+.page-tag {
+  display: inline-block;
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  color: #7c3aed;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid #ddd6fe;
+  background: #f5f3ff;
+  margin-bottom: 6px;
+}
+
+.page-title {
+  font-size: 22px;
+  font-weight: 700;
+  color: #1e293b;
+  margin: 0;
+}
+
+.page-desc {
+  font-size: 13px;
+  color: #64748b;
+  margin: 6px 0 0;
+  line-height: 1.5;
+}
+
+.role-badge {
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  &.admin { background: #eff6ff; color: #2563eb; border: 1px solid #bfdbfe; }
+  &.user { background: #f8fafc; color: #64748b; border: 1px solid #e2e8f0; }
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.stat-card {
+  position: relative;
+  padding: 14px 16px;
+  border-radius: 14px;
+  border: 1px solid color-mix(in srgb, var(--card-accent) 18%, #e2e8f0);
+  background:
+    radial-gradient(ellipse at 100% 0%, color-mix(in srgb, var(--card-accent) 8%, transparent), transparent 60%),
+    #fff;
+  box-shadow: 0 2px 10px rgba(15, 23, 42, 0.04);
+  overflow: hidden;
+  transition: transform 0.15s, box-shadow 0.15s, border-color 0.15s;
+  &:hover {
+    transform: translateY(-1px);
+    border-color: color-mix(in srgb, var(--card-accent) 30%, #cbd5e1);
+    box-shadow: 0 8px 24px color-mix(in srgb, var(--card-accent) 10%, rgba(15, 23, 42, 0.06));
+  }
+}
+
+.card-glow {
+  position: absolute;
+  inset: -30% auto auto -10%;
+  width: 70px;
+  height: 70px;
+  background: radial-gradient(circle, color-mix(in srgb, var(--card-accent) 12%, transparent), transparent 70%);
+  pointer-events: none;
+}
+
+.stat-code {
+  display: block;
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: var(--card-accent);
+  opacity: 0.85;
+  margin-bottom: 2px;
+}
+
+.stat-label { display: block; font-size: 11px; color: #94a3b8; margin-bottom: 4px; }
+.stat-value {
+  display: block;
+  font-size: 22px;
+  font-weight: 800;
+  line-height: 1.1;
+  color: var(--card-accent);
+  font-family: 'JetBrains Mono', Consolas, monospace;
+}
+.stat-hint { display: block; font-size: 10px; color: #cbd5e1; margin-top: 4px; }
 
 .execution-result {
   margin-bottom: 16px;
   padding: 14px 16px;
   background: #f8fafc;
   border: 1px solid #e2e8f0;
-  border-radius: 10px;
+  border-radius: 12px;
   .exec-head {
     display: flex;
     align-items: center;
@@ -189,7 +561,6 @@ onMounted(() => { loadPending(); loadHistory() })
       font-size: 18px;
       cursor: pointer;
       color: #94a3b8;
-      &:hover { color: #1e293b; }
     }
   }
   .exec-output {
@@ -197,149 +568,263 @@ onMounted(() => { loadPending(); loadHistory() })
     font-size: 12px;
     background: #fff;
     border: 1px solid #e2e8f0;
-    border-radius: 6px;
+    border-radius: 8px;
     padding: 10px;
     max-height: 200px;
     overflow: auto;
     font-family: 'JetBrains Mono', monospace;
-    color: #334155;
   }
 }
 
-.page-header {
-  margin-bottom: 20px;
-  .page-title { font-size: 20px; font-weight: 700; color: #1e293b; }
-  .page-desc { font-size: 13px; color: #94a3b8; margin-top: 4px; }
+.tabs-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
 }
 
-.tabs-row { display: flex; gap: 4px; margin-bottom: 16px; }
-
 .tab-btn {
-  padding: 8px 20px;
+  padding: 10px 20px;
   border: 1px solid #e2e8f0;
   background: #fff;
   color: #64748b;
   font-size: 13px;
-  font-weight: 500;
-  border-radius: 8px;
+  font-weight: 600;
+  border-radius: 10px;
   cursor: pointer;
-  display: flex;
+  display: inline-flex;
   align-items: center;
   gap: 8px;
   transition: all 0.15s;
-  &:hover { border-color: #2563eb; color: #2563eb; }
+  &:hover { border-color: #c4b5fd; color: #7c3aed; }
   &.active {
-    color: #2563eb;
-    border-color: #2563eb;
-    background: #eff6ff;
+    color: #7c3aed;
+    border-color: #7c3aed;
+    background: linear-gradient(180deg, #f5f3ff, #fff);
+    box-shadow: 0 4px 12px rgba(124, 58, 237, 0.12);
   }
+}
+
+.tab-icon {
+  display: flex;
+  align-items: center;
+  opacity: 0.85;
 }
 
 .tab-badge {
-  background: #fef2f2;
-  color: #ef4444;
-  padding: 1px 7px;
-  border-radius: 10px;
+  background: #ef4444;
+  color: #fff;
+  padding: 1px 8px;
+  border-radius: 999px;
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 700;
 }
 
-.approval-card {
-  display: flex;
+.content-panel {
   padding: 20px;
-  margin-bottom: 12px;
+  border-radius: 16px;
+  border: 1px solid #e2e8f0;
+  background: #fff;
+  box-shadow: 0 2px 12px rgba(15, 23, 42, 0.04);
 }
 
-.card-left { flex: 1; min-width: 0; }
+.section-head {
+  margin-bottom: 16px;
+}
 
-.card-head {
-  display: flex; align-items: center; gap: 8px;
-  margin-bottom: 6px;
-  .card-tool {
-    font-family: 'JetBrains Mono', Consolas, monospace;
-    font-size: 15px;
-    color: #2563eb;
-    font-weight: 600;
+.section-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: #1e293b;
+}
+
+.section-tip {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: #64748b;
+}
+
+.flow-list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.pagination-row {
+  display: flex;
+  justify-content: center;
+  margin-top: 8px;
+  padding-top: 16px;
+  border-top: 1px solid #f1f5f9;
+}
+
+.empty-state {
+  text-align: center;
+  padding: 56px 24px;
+  background: #f8fafc;
+  border: 1px dashed #e2e8f0;
+  border-radius: 14px;
+  .empty-icon {
+    width: 48px;
+    height: 48px;
+    margin: 0 auto 12px;
+    border-radius: 50%;
+    background: #ecfdf5;
+    color: #059669;
+    font-size: 22px;
+    line-height: 48px;
+    font-weight: 700;
+  }
+  p { margin: 0; font-size: 15px; font-weight: 600; color: #64748b; }
+  .empty-hint { display: block; margin-top: 6px; font-size: 12px; color: #94a3b8; }
+}
+
+.source-pill {
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  background: #eef2ff;
+  color: #4338ca;
+  &.sm { font-size: 10px; padding: 2px 8px; }
+}
+
+.result-pill {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  &.ok { background: #ecfdf5; color: #059669; }
+  &.warn { background: #fffbeb; color: #d97706; }
+  &.fail { background: #fef2f2; color: #dc2626; }
+  &.pending { background: #eff6ff; color: #2563eb; }
+}
+
+.risk-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  &.l3 { background: #fff7ed; color: #ea580c; }
+  &.l4, &.l5 { background: #fef2f2; color: #dc2626; }
+}
+
+.dialog-btn {
+  padding: 8px 18px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid #e2e8f0;
+  background: #fff;
+  color: #64748b;
+  margin-left: 8px;
+  &.primary {
+    color: #fff;
+    background: #2563eb;
+    border-color: #2563eb;
+    &:hover:not(:disabled) { background: #1d4ed8; }
+    &:disabled { opacity: 0.6; cursor: not-allowed; }
+  }
+  &.danger {
+    color: #fff;
+    background: #dc2626;
+    border-color: #dc2626;
+    &:hover:not(:disabled) { background: #b91c1c; }
+    &:disabled { opacity: 0.6; cursor: not-allowed; }
   }
 }
 
-.card-detail { font-size: 13px; color: #1e293b; margin-bottom: 6px; }
+.delete-dialog-body { text-align: center; padding: 4px 8px 0; }
 
-.card-meta {
-  display: flex; gap: 16px;
-  font-size: 11px; color: #94a3b8;
-  .expire { color: #f59e0b; }
-}
-
-.card-params {
-  margin-top: 10px;
-  .params-label { font-size: 11px; font-weight: 600; color: #94a3b8; margin-bottom: 4px; }
-}
-
-.code-mini {
-  font-family: 'JetBrains Mono', Consolas, monospace;
-  font-size: 12px;
-  background: #f8fafc;
-  color: #1e293b;
-  padding: 8px 12px;
-  border-radius: 6px;
-  border: 1px solid #e2e8f0;
-  max-height: 120px;
-  overflow: auto;
-}
-
-.card-actions {
+.delete-icon-wrap {
+  width: 52px;
+  height: 52px;
+  margin: 0 auto 14px;
+  border-radius: 50%;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
   display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding-left: 20px;
-  margin-left: 20px;
-  border-left: 1px solid #f1f5f9;
+  align-items: center;
+  justify-content: center;
 }
 
-.act-btn {
+.delete-icon { width: 26px; height: 26px; color: #dc2626; }
+
+.delete-title {
+  margin: 0 0 6px;
+  font-size: 17px;
+  font-weight: 700;
+  color: #1e293b;
+}
+
+.delete-desc {
+  margin: 0 0 16px;
+  font-size: 13px;
+  color: #94a3b8;
+  line-height: 1.5;
+}
+
+.delete-preview {
+  text-align: left;
+  padding: 14px;
+  border-radius: 12px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+}
+
+.preview-head {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 10px 16px;
-  border-radius: 8px;
-  border: 1px solid;
-  background: #fff;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.preview-event {
+  margin: 0 0 6px;
   font-size: 14px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: all 0.15s;
-  &.approve {
-    color: #059669;
-    border-color: #a7f3d0;
-    &:hover { background: #ecfdf5; border-color: #10b981; }
-  }
-  &.reject {
-    color: #dc2626;
-    border-color: #fecaca;
-    &:hover { background: #fef2f2; border-color: #ef4444; }
-  }
+  font-weight: 600;
+  color: #1e293b;
+  line-height: 1.45;
 }
 
-.btn-spinner {
-  width: 14px; height: 14px;
-  border: 2px solid #a7f3d0;
-  border-top-color: #059669;
-  border-radius: 50%;
-  animation: spin 0.6s linear infinite;
-  display: inline-block;
-}
-@keyframes spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
+.preview-cmd {
+  display: block;
+  font-size: 11px;
+  color: #64748b;
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  background: #fff;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid #eef2f7;
+  word-break: break-all;
+  margin-bottom: 8px;
 }
 
-.no-permission-tip {
-  font-size: 12px; color: #94a3b8;
-  padding: 10px 0; text-align: center;
+.preview-meta {
+  display: flex;
+  gap: 12px;
+  font-size: 11px;
+  color: #94a3b8;
 }
-.empty-state { text-align: center; padding: 48px; color: #94a3b8; }
 
-.ok { color: #059669; font-weight: 600; }
-.fail { color: #dc2626; font-weight: 600; }
+.delete-footer {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  .dialog-btn { margin-left: 0; min-width: 96px; }
+}
+
+@media (max-width: 960px) {
+  .stats-grid { grid-template-columns: repeat(2, 1fr); }
+}
+</style>
+
+<style lang="scss">
+.approval-delete-dialog .el-dialog__header { display: none; }
+.approval-delete-dialog .el-dialog__body { padding: 28px 24px 8px; }
+.approval-delete-dialog .el-dialog__footer { padding: 12px 24px 24px; border-top: none; }
 </style>

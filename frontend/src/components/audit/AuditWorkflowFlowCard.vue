@@ -1,0 +1,547 @@
+<template>
+  <article class="wf-card" :style="cardStyle" @click="$emit('open', record)">
+    <div class="wf-glow" aria-hidden="true"></div>
+
+    <header class="wf-header">
+      <div class="wf-link-badge">
+        <span class="link-code">{{ linkMeta.code }}</span>
+        <div class="link-text">
+          <strong>{{ linkMeta.label }}</strong>
+          <span>{{ linkMeta.desc }}</span>
+        </div>
+      </div>
+      <div class="wf-header-right">
+        <span class="flow-status" :class="flowStatusClass">{{ flowStatusText }}</span>
+        <span class="risk-tag" :class="riskClass(record.riskLevel)">{{ record.riskLevel || 'L1' }}</span>
+        <time class="wf-time">{{ formatTime(record.timestamp) }}</time>
+      </div>
+    </header>
+
+    <p class="wf-question">{{ displayQuestion }}</p>
+
+    <div class="wf-pipeline">
+      <div class="pipeline-track" aria-hidden="true">
+        <svg class="track-svg" preserveAspectRatio="none">
+          <defs>
+            <linearGradient :id="`grad-${uid}`" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" :stop-color="linkMeta.color" stop-opacity="0.15" />
+              <stop offset="50%" :stop-color="linkMeta.color" stop-opacity="0.55" />
+              <stop offset="100%" :stop-color="linkMeta.color" stop-opacity="0.15" />
+            </linearGradient>
+          </defs>
+          <line
+            x1="0" y1="50%" x2="100%" y2="50%"
+            :stroke="`url(#grad-${uid})`"
+            stroke-width="2"
+            stroke-dasharray="6 4"
+          />
+        </svg>
+      </div>
+
+      <div class="node-row">
+        <div
+          v-for="(node, idx) in flowNodes"
+          :key="node.id"
+          class="node-wrap"
+        >
+          <div
+            class="flow-node"
+            :class="[node.kind, `tone-${statusTone(node.status)}`, { active: node.status === 'passed' || node.status === 'pending' }]"
+            :title="node.detail"
+          >
+            <span class="node-index">{{ String(idx + 1).padStart(2, '0') }}</span>
+            <div class="node-body">
+              <span class="node-label">{{ node.label }}</span>
+              <span class="node-sub">{{ node.sublabel }}</span>
+              <span v-if="node.detail" class="node-detail">{{ node.detail }}</span>
+              <div class="node-meta">
+                <span v-if="node.durationMs != null" class="meta-chip">{{ formatMs(node.durationMs) }}</span>
+                <span v-if="node.riskLevel" class="meta-chip risk">{{ node.riskLevel }}</span>
+                <span class="meta-chip status">{{ statusLabel(node.status) }}</span>
+              </div>
+            </div>
+            <div v-if="node.kind === 'decision'" class="node-diamond" aria-hidden="true"></div>
+          </div>
+          <div v-if="idx < flowNodes.length - 1" class="node-connector" aria-hidden="true">
+            <svg width="28" height="16" viewBox="0 0 28 16">
+              <path
+                d="M0 8 H18 L14 4 M18 8 L14 12"
+                fill="none"
+                :stroke="linkMeta.color"
+                stroke-width="1.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                opacity="0.65"
+              />
+            </svg>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <footer class="wf-footer">
+      <span class="meta-item">
+        <AuditIcon name="meta-user" tone="muted" size="sm" />
+        {{ displayUser }}
+      </span>
+      <span class="meta-item mono">
+        <AuditIcon name="meta-trace" tone="muted" size="sm" />
+        {{ shortTrace }}
+      </span>
+      <span v-if="record.totalMs != null" class="meta-item">
+        <AuditIcon name="meta-time" tone="muted" size="sm" />
+        {{ formatMs(record.totalMs) }}
+      </span>
+      <span v-if="record.toolCount" class="meta-item">
+        <AuditIcon name="meta-tool" tone="muted" size="sm" />
+        {{ record.toolCount }} 工具
+      </span>
+      <div class="wf-actions" @click.stop>
+        <button class="action-btn" @click="$emit('detail', record)">详情</button>
+        <button class="action-btn primary" @click="$emit('replay', record.traceId)">
+          <AuditIcon name="action-replay" tone="blue" size="sm" /> 回放
+        </button>
+        <button
+          v-if="record.sessionId"
+          class="action-btn"
+          @click="$emit('goto-chat', { sessionId: record.sessionId!, traceId: record.traceId })"
+        >对话</button>
+      </div>
+    </footer>
+  </article>
+</template>
+
+<script setup lang="ts">
+import { computed } from 'vue'
+import AuditIcon from './AuditIcon.vue'
+import type { AuditRecordItem } from './auditEventMeta'
+import { formatMs, riskClass } from './auditEventMeta'
+import {
+  LINK_CATALOG,
+  buildFlowNodes,
+  flowStatusLabel,
+  resolveWorkflowLink,
+  statusTone,
+  type FlowNodeStatus,
+} from './workflowLinkMeta'
+import { formatTime } from '@/utils'
+
+const props = defineProps<{ record: AuditRecordItem }>()
+
+defineEmits<{
+  open: [record: AuditRecordItem]
+  detail: [record: AuditRecordItem]
+  replay: [traceId: string]
+  'goto-chat': [payload: { sessionId: string; traceId?: string }]
+}>()
+
+const uid = Math.random().toString(36).slice(2, 8)
+
+const linkId = computed(() =>
+  resolveWorkflowLink(props.record.workflowLink, props.record.intent),
+)
+
+const linkMeta = computed(() => LINK_CATALOG[linkId.value])
+
+const cardStyle = computed(() => ({
+  '--link-color': linkMeta.value.color,
+  '--link-glow': linkMeta.value.glow,
+}))
+
+const flowNodes = computed(() =>
+  buildFlowNodes(
+    linkId.value,
+    props.record.workflowStages || [],
+    props.record.flowStatus,
+    props.record.toolCount || 0,
+  ),
+)
+
+const displayQuestion = computed(() =>
+  props.record.workflowQuestion || props.record.summary || '—',
+)
+
+const flowStatusText = computed(() => flowStatusLabel(props.record.flowStatus))
+
+const flowStatusClass = computed(() => {
+  const s = props.record.flowStatus
+  if (s === 'blocked' || s === 'failed') return 'danger'
+  if (s === 'pending_approval' || s === 'awaiting_plan_confirm' || s === 'awaiting_user_action') return 'warn'
+  if (s === 'completed') return 'ok'
+  return 'muted'
+})
+
+const shortTrace = computed(() => {
+  const id = props.record.traceId || ''
+  return id.length > 16 ? `${id.slice(0, 16)}…` : id
+})
+
+const displayUser = computed(() => {
+  const name = props.record.userDisplayName || props.record.username
+  if (name && props.record.userRoleLabel) return `${name}（${props.record.userRoleLabel}）`
+  return name || props.record.userId
+})
+
+function statusLabel(s: FlowNodeStatus): string {
+  const m: Record<FlowNodeStatus, string> = {
+    passed: '通过',
+    blocked: '阻断',
+    failed: '失败',
+    pending: '等待',
+    warning: '注意',
+    idle: '—',
+    skipped: '跳过',
+  }
+  return m[s] || s
+}
+</script>
+
+<style scoped lang="scss">
+.wf-card {
+  position: relative;
+  border-radius: 16px;
+  border: 1px solid color-mix(in srgb, var(--link-color) 18%, #e2e8f0);
+  background:
+    radial-gradient(ellipse 80% 60% at 10% 0%, color-mix(in srgb, var(--link-color) 6%, transparent), transparent 55%),
+    #fff;
+  padding: 18px 20px 16px;
+  cursor: pointer;
+  overflow: hidden;
+  box-shadow: 0 2px 10px rgba(15, 23, 42, 0.04);
+  transition: border-color 0.2s, box-shadow 0.25s, transform 0.2s;
+
+  &:hover {
+    border-color: color-mix(in srgb, var(--link-color) 35%, #cbd5e1);
+    box-shadow: 0 10px 28px color-mix(in srgb, var(--link-color) 10%, rgba(15, 23, 42, 0.06));
+    transform: translateY(-1px);
+  }
+}
+
+.wf-glow {
+  position: absolute;
+  inset: -40% -20% auto;
+  height: 120px;
+  background: radial-gradient(ellipse, color-mix(in srgb, var(--link-color) 8%, transparent), transparent 70%);
+  pointer-events: none;
+  opacity: 0.9;
+}
+
+.wf-header {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.wf-link-badge {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.link-code {
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: var(--link-color);
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--link-color) 30%, #e2e8f0);
+  background: color-mix(in srgb, var(--link-color) 8%, #fff);
+  box-shadow: none;
+}
+
+.link-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  strong {
+    font-size: 14px;
+    font-weight: 700;
+    color: #1e293b;
+  }
+  span {
+    font-size: 11px;
+    color: #64748b;
+  }
+}
+
+.wf-header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.flow-status {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 3px 8px;
+  border-radius: 999px;
+  &.ok { background: #ecfdf5; color: #059669; border: 1px solid #a7f3d0; }
+  &.danger { background: #fef2f2; color: #dc2626; border: 1px solid #fecaca; }
+  &.warn { background: #fffbeb; color: #d97706; border: 1px solid #fde68a; }
+  &.muted { background: #f1f5f9; color: #64748b; border: 1px solid #e2e8f0; }
+}
+
+.risk-tag {
+  font-size: 10px;
+  font-weight: 800;
+  padding: 2px 6px;
+  border-radius: 4px;
+  &.l1 { color: #059669; background: #ecfdf5; }
+  &.l2 { color: #0891b2; background: #ecfeff; }
+  &.l3 { color: #d97706; background: #fffbeb; }
+  &.l4 { color: #dc2626; background: #fef2f2; }
+  &.l5 { color: #be123c; background: #fff1f2; }
+}
+
+.wf-time {
+  font-size: 11px;
+  color: #64748b;
+}
+
+.wf-question {
+  position: relative;
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  font-size: 14px;
+  font-weight: 500;
+  color: #334155;
+  line-height: 1.5;
+}
+
+.wf-pipeline {
+  position: relative;
+  margin-bottom: 14px;
+  padding: 12px 4px 8px;
+  border-radius: 12px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  overflow-x: auto;
+}
+
+.pipeline-track {
+  position: absolute;
+  left: 16px;
+  right: 16px;
+  top: 50%;
+  height: 2px;
+  transform: translateY(-50%);
+  pointer-events: none;
+  opacity: 0.5;
+}
+
+.track-svg {
+  width: 100%;
+  height: 100%;
+}
+
+.node-row {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  min-width: min-content;
+  padding: 4px 8px;
+}
+
+.node-wrap {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.flow-node {
+  position: relative;
+  width: 132px;
+  min-height: 88px;
+  padding: 8px 8px 8px 6px;
+  border-radius: 10px;
+  border: 1px solid #e2e8f0;
+  background: #fff;
+  display: flex;
+  gap: 6px;
+  transition: box-shadow 0.2s, border-color 0.2s;
+
+  &.active {
+    border-color: color-mix(in srgb, var(--link-color) 40%, #cbd5e1);
+    box-shadow: 0 4px 14px color-mix(in srgb, var(--link-color) 12%, rgba(15, 23, 42, 0.05));
+  }
+
+  &.tone-ok { .node-index { color: #059669; border-color: #a7f3d0; background: #ecfdf5; } }
+  &.tone-danger { border-color: #fecaca; .node-index { color: #dc2626; background: #fef2f2; } }
+  &.tone-warn { border-color: #fde68a; .node-index { color: #d97706; background: #fffbeb; } }
+  &.tone-muted { opacity: 0.85; background: #fafafa; }
+
+  &.decision {
+    border-radius: 4px;
+    transform: rotate(0deg);
+    .node-diamond {
+      position: absolute;
+      inset: -1px;
+      border: 1px solid color-mix(in srgb, var(--link-color) 40%, transparent);
+      border-radius: 4px;
+      transform: rotate(45deg) scale(0.72);
+      pointer-events: none;
+      opacity: 0.35;
+    }
+  }
+
+  &.start .node-index { color: var(--link-color); }
+  &.end .node-body .node-label { font-size: 11px; }
+}
+
+.node-index {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 9px;
+  font-weight: 800;
+  color: #64748b;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: #f8fafc;
+}
+
+.node-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.node-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: #1e293b;
+  line-height: 1.25;
+}
+
+.node-sub {
+  font-size: 9px;
+  color: #64748b;
+  line-height: 1.3;
+}
+
+.node-detail {
+  font-size: 8px;
+  color: #94a3b8;
+  margin-top: 2px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.node-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-top: 4px;
+}
+
+.meta-chip {
+  font-size: 8px;
+  font-weight: 700;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: #f1f5f9;
+  color: #64748b;
+  border: 1px solid #e2e8f0;
+  &.risk { color: #d97706; background: #fffbeb; border-color: #fde68a; }
+  &.status { color: #475569; }
+}
+
+.node-connector {
+  display: flex;
+  align-items: center;
+  padding: 0 2px;
+  flex-shrink: 0;
+}
+
+.wf-footer {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  font-size: 11px;
+  color: #64748b;
+  padding-top: 12px;
+  border-top: 1px solid #f1f5f9;
+}
+
+.meta-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  &.mono { font-family: 'JetBrains Mono', Consolas, monospace; }
+}
+
+.wf-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+
+.action-btn {
+  border: 1px solid #e2e8f0;
+  background: #fff;
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 5px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+  &:hover {
+    color: #2563eb;
+    border-color: #bfdbfe;
+    background: #f8fafc;
+  }
+  &.primary {
+    color: var(--link-color);
+    border-color: color-mix(in srgb, var(--link-color) 35%, #e2e8f0);
+    background: color-mix(in srgb, var(--link-color) 8%, #fff);
+  }
+}
+
+@media (max-width: 900px) {
+  .node-row {
+    flex-direction: column;
+    align-items: stretch;
+    padding: 8px;
+  }
+  .node-wrap {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .flow-node {
+    width: 100%;
+    min-height: 0;
+  }
+  .node-connector {
+    justify-content: center;
+    padding: 4px 0;
+    svg { transform: rotate(90deg); }
+  }
+  .pipeline-track { display: none; }
+}
+</style>

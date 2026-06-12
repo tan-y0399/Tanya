@@ -36,3 +36,8 @@ export async function toggleTool(toolId: string, enabled: boolean) {
   const { data } = await api.post(`/tools/${toolId}/toggle`, { enabled })
   return data
 }
+
+export async function batchUpdateTools(updates: { id: string; enabled: boolean }[]) {
+  const { data } = await api.put('/tools/batch', { updates })
+  return data
+}

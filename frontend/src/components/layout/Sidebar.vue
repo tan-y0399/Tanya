@@ -62,6 +62,20 @@
           <span>审批管理</span>
           <span class="nav-badge danger" v-if="pendingCount">{{ pendingCount }}</span>
         </router-link>
+        <router-link to="/audit" class="nav-item" :class="{ active: $route.path === '/audit' }">
+          <svg class="nav-icon" width="18" height="18" viewBox="0 0 18 18" fill="none">
+            <path d="M3 4h12M3 8h8M3 12h5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            <circle cx="14" cy="13" r="3" stroke="currentColor" stroke-width="1.5"/>
+          </svg>
+          <span>审计日志</span>
+        </router-link>
+        <router-link to="/alerts" class="nav-item" :class="{ active: $route.path === '/alerts' }">
+          <svg class="nav-icon" width="18" height="18" viewBox="0 0 18 18" fill="none">
+            <path d="M9 2.5a4.5 4.5 0 00-4.5 4.5v2.1l-.9 1.8a1 1 0 00.9 1.5h9a1 1 0 00.9-1.5l-.9-1.8V7A4.5 4.5 0 009 2.5z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+            <path d="M7.5 14a1.5 1.5 0 003 0" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+          <span>告警中心</span>
+        </router-link>
       </template>
 
       <!-- ===== 用户菜单 ===== -->
@@ -105,6 +119,13 @@
             <circle cx="12" cy="5" r="1" fill="currentColor"/>
           </svg>
           <span>服务器</span>
+        </router-link>
+        <router-link to="/alerts" class="nav-item" :class="{ active: $route.path === '/alerts' }">
+          <svg class="nav-icon" width="18" height="18" viewBox="0 0 18 18" fill="none">
+            <path d="M9 2.5a4.5 4.5 0 00-4.5 4.5v2.1l-.9 1.8a1 1 0 00.9 1.5h9a1 1 0 00.9-1.5l-.9-1.8V7A4.5 4.5 0 009 2.5z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+            <path d="M7.5 14a1.5 1.5 0 003 0" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+          <span>告警中心</span>
         </router-link>
         <router-link to="/dashboard" class="nav-item" :class="{ active: $route.path === '/dashboard' }">
           <svg class="nav-icon" width="18" height="18" viewBox="0 0 18 18" fill="none">

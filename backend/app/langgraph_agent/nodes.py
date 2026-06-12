@@ -186,7 +186,9 @@ def _execute_tool(name: str, args: dict) -> dict:
                               timeout=args.get("timeout", 30))
 
     if name in tool_map:
-        return remote_exec(tool_map[name], **args)
+        from app.services.tool_args import normalize_tool_args
+        remote_name = tool_map[name]
+        return remote_exec(remote_name, **normalize_tool_args(remote_name, args))
 
     if name == "search_journal_logs":
         service = args.get("service", "")
@@ -213,6 +215,8 @@ def _execute_tool(name: str, args: dict) -> dict:
 
 async def _call_llm(messages: List[Dict], stream: bool = False):
     """调用 DeepSeek API"""
+    from app.services.chat_service import prepare_messages_for_llm
+    messages = prepare_messages_for_llm(messages)
     url = f"{settings.llm_api_base}/chat/completions"
     headers = {
         "Authorization": f"Bearer {settings.llm_api_key}",
@@ -287,8 +291,10 @@ async def intent_risk_filter_node(state: AgentState) -> AgentState:
     user_input = state["user_input"]
     logger.info(f"[意图风险过滤] 处理输入: {user_input[:50]}...")
 
-    # 1. 注入检测
-    security_result = await security_gate(user_input, use_llm=True)
+    # 1. 注入检测 v2（含角色预检）
+    role = state.get("user_role", "user")
+    text = state.get("sanitized_input") or user_input
+    security_result = await security_gate(text, use_llm=True, user_role=role)
     if not security_result["pass"]:
         return {
             **state,
@@ -300,7 +306,7 @@ async def intent_risk_filter_node(state: AgentState) -> AgentState:
         }
 
     # 2. 意图分类
-    intent_result = await classify_intent(user_input)
+    intent_result = await classify_intent(text)
     if intent_result.get("is_injection"):
         return {
             **state,
@@ -322,6 +328,8 @@ async def intent_risk_filter_node(state: AgentState) -> AgentState:
         "injection_severity": None,
         "blocked": False,
         "intent_result": intent_result,
+        "security_gate_details": security_result.get("details"),
+        "sanitized_input": security_result.get("sanitized_input", text),
     }
 
 
@@ -780,6 +788,7 @@ async def tool_execution_node(state: AgentState) -> AgentState:
     any_executed = False
     any_pending_approval = False
     any_pending_confirm = False
+    cmd_log = list(state.get("execution_command_log") or [])
 
     for tc in tool_calls:
         status = tc.get("status", "pending")
@@ -823,6 +832,11 @@ async def tool_execution_node(state: AgentState) -> AgentState:
                     "content": json.dumps(result, ensure_ascii=False),
                 })
                 any_executed = True
+                from .nodes_supervision import append_execution_log
+                cmd_log = append_execution_log(
+                    {**state, "execution_command_log": cmd_log},
+                    tc["tool_name"], tc["tool_args"], result,
+                )
                 logger.info(f"[工具执行] {tc['tool_name']} → {'成功' if result.get('success') else '失败'}")
             except Exception as e:
                 tc["status"] = "executed"
@@ -842,38 +856,34 @@ async def tool_execution_node(state: AgentState) -> AgentState:
     # 决定下一步
     round_count = state.get("round_count", 0) + 1
 
-    if any_pending_approval or any_pending_confirm:
-        # 需要用户操作 → 暂停 ReAct 循环，进入响应组装
-        return {
-            **state,
-            "current_stage": AgentStage.RESPONSE_ASSEMBLY,
-            "messages": messages,
-            "tool_calls": tool_calls,
-            "execution_results": execution_results,
-            "require_approval": any_pending_approval,
-            "require_confirm": any_pending_confirm,
-            "round_count": round_count,
-        }
-
-    if any_executed:
-        # 工具已执行 → 返回推理节点继续 ReAct 循环
-        return {
-            **state,
-            "current_stage": AgentStage.REASONING,
-            "messages": messages,
-            "tool_calls": tool_calls,
-            "execution_results": execution_results,
-            "round_count": round_count,
-        }
-
-    # 没有可执行的工具
-    return {
-        **state,
-        "current_stage": AgentStage.RESPONSE_ASSEMBLY,
+    base_out = {
         "messages": messages,
         "tool_calls": tool_calls,
         "execution_results": execution_results,
+        "execution_command_log": cmd_log,
         "round_count": round_count,
+    }
+
+    if any_pending_approval or any_pending_confirm:
+        return {
+            **state,
+            **base_out,
+            "current_stage": AgentStage.RESPONSE_ASSEMBLY,
+            "require_approval": any_pending_approval,
+            "require_confirm": any_pending_confirm,
+        }
+
+    if any_executed:
+        return {
+            **state,
+            **base_out,
+            "current_stage": AgentStage.REASONING,
+        }
+
+    return {
+        **state,
+        **base_out,
+        "current_stage": AgentStage.RESPONSE_ASSEMBLY,
     }
 
 
@@ -1013,10 +1023,42 @@ async def response_assembly_node(state: AgentState) -> AgentState:
             f"请在下方确认或取消。"
         )
 
+    ops_report = None
+    if state.get("route_path") == "react_b" and tool_calls:
+        from app.services.human_supervision import build_structured_ops_report
+        tool_records = [
+            {
+                "toolName": tc["tool_name"],
+                "status": tc.get("status"),
+                "riskLevel": tc.get("risk_level"),
+                "result": tc.get("result"),
+                "displaySummary": (tc.get("result") or {}).get("display_summary", ""),
+            }
+            for tc in tool_calls
+        ]
+        ops_report = build_structured_ops_report(
+            state.get("user_input", ""),
+            state.get("trace_id", ""),
+            tool_records,
+            state.get("intent", ""),
+        )
+        if ops_report and "<!--KYLIN_REPORT-->" not in final_response:
+            final_response = final_response + "\n\n<!--KYLIN_REPORT-->\n\n" + ops_report
+
+    final_status = state.get("final_status", "processing")
+    if state.get("require_approval"):
+        final_status = "awaiting_approval"
+    elif state.get("require_confirm"):
+        final_status = "awaiting_confirm"
+    elif state.get("awaiting_user_action"):
+        final_status = "awaiting_plan_confirm"
+
     return {
         **state,
         "current_stage": AgentStage.COMPLETED,
         "final_response": final_response,
+        "ops_report": ops_report,
+        "final_status": final_status,
         "risk_color": risk_color_map.get(highest_risk, "blue"),
         "state_cards": state_cards,
         "reasoning_chain_visible": len(state.get("reasoning_steps", [])) > 0,

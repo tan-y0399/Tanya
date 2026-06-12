@@ -80,6 +80,13 @@ a {
   color: #1e293b;
 }
 
+// KylinOps 品牌英文字体（与 logo / 标题一致）
+$font-brand-en: 'Inter', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+
+.font-brand-en {
+  font-family: $font-brand-en;
+}
+
 // ==============================
 // 通用工具类
 // ==============================
@@ -194,6 +201,7 @@ a {
   &.l2 { background: #fffbeb; color: #b45309; border: 1px solid #fde68a; }
   &.l3 { background: #fef2f2; color: #dc2626; border: 1px solid #fecaca; }
   &.l4 { background: #fef2f2; color: #991b1b; border: 1px solid #fca5a5; }
+  &.l5 { background: #450a0a; color: #fecaca; border: 1px solid #991b1b; }
 }
 
 // 科技风输入框

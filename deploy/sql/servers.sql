@@ -1,0 +1,1 @@
+INSERT INTO "servers" ("id", "name", "host", "port", "username", "key_path", "description", "tags", "is_default", "status", "last_checked", "created_at", "updated_at") VALUES ('95bce4242f02', '默认麒麟服务器', '192.168.163.15', 22, 'root', '~/.ssh/id_rsa', '系统默认服务器（来自 .env 配置）', '', 't', 'online', '2026-05-29 08:19:36.506854', '2026-05-26 06:38:21.673004', '2026-05-29 08:19:35.90133');

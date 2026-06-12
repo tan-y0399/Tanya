@@ -12,7 +12,9 @@ from app.core.database import init_db, async_session, close_db
 from app.core.security import hash_password
 from app.models.user import User
 from app.models.server import Server
-from app.api.routes import auth, chat, audit, approval, system, dashboard, knowledge, alerts, servers, users, tools, feedback
+from app.api.routes import auth, chat, audit, approval, system, dashboard, knowledge, alerts, servers, users, tools, feedback, trace_outcome
+from app.models.supervision import SupervisionPlan, TraceOutcome
+from app.models.execution_log import ExecutionLog
 from app.api.routes.knowledge import seed_knowledge
 # from app.mcp.server import router as mcp_router
 
@@ -44,6 +46,16 @@ async def startup():
     await init_db()
 
     async with async_session() as db:
+        try:
+            from app.services.feedback_sync import ensure_feedback_schema
+            await ensure_feedback_schema(db)
+        except Exception as e:
+            logger.warning("feedback schema migrate: %s", e)
+        try:
+            from app.services.knowledge_engagement import ensure_knowledge_schema
+            await ensure_knowledge_schema(db)
+        except Exception as e:
+            logger.warning("knowledge schema migrate: %s", e)
         # ✅ 安全的首次启动检测：使用标记文件，不会误判
         if _is_first_startup():
             logger.info("🎉 First startup detected — initializing database...")
@@ -90,6 +102,25 @@ async def startup():
 
         result = await db.execute(select(Server))
         servers = result.scalars().all()
+
+        from app.services.server_user_policy import is_restricted_ssh_user, default_ops_ssh_user
+        from app.services.ssh_client import SSH_POOL
+
+        ops_user = default_ops_ssh_user()
+        legacy_users = {"root", "administrator", "test"}
+        migrated = False
+        for s in servers:
+            uname = (s.username or "").strip().lower()
+            if is_restricted_ssh_user(s.username) or (uname in legacy_users and uname != ops_user.lower()):
+                s.username = ops_user
+                migrated = True
+        if migrated:
+            await db.commit()
+            SSH_POOL.close_all()
+            logger.info("Migrated SSH users to %s", ops_user)
+            result = await db.execute(select(Server))
+            servers = result.scalars().all()
+
         if not servers:
             default_server = Server(
                 name="默认麒麟服务器",
@@ -135,7 +166,18 @@ app.include_router(servers.router, prefix="/api/v1")
 app.include_router(users.router, prefix="/api/v1")
 app.include_router(tools.router, prefix="/api/v1")
 app.include_router(feedback.router, prefix="/api/v1")
+app.include_router(trace_outcome.router, prefix="/api/v1")
 # app.include_router(mcp_router)
+
+from app.services.feedback_upload import feedback_upload_dir as _feedback_upload_dir
+
+_fb_upload_path = _feedback_upload_dir()
+if _fb_upload_path.is_dir():
+    app.mount(
+        "/api/v1/feedback/files",
+        StaticFiles(directory=str(_fb_upload_path)),
+        name="feedback_files",
+    )
 
 if os.path.isdir(FRONTEND_DIST):
     app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")

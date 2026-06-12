@@ -10,7 +10,7 @@
     <Sidebar />
     <div class="main-area">
       <TopBar />
-      <div class="page-content">
+      <div class="page-content" :class="{ 'page-content--flush': isFlushPage }">
         <router-view />
       </div>
     </div>
@@ -18,11 +18,15 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { useRoute } from 'vue-router'
 import Sidebar from './Sidebar.vue'
 import TopBar from './TopBar.vue'
 
 interface FailoverServer { label: string; url: string }
+
+const route = useRoute()
+const isFlushPage = computed(() => ['Dashboard', 'Servers', 'Alerts', 'UserFeedback', 'Admin', 'Knowledge'].includes(String(route.name)))
 
 const showFailover = ref(false)
 const failoverServers = ref<FailoverServer[]>([])
@@ -68,4 +72,5 @@ onUnmounted(() => {
 
 .main-area { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; background: #f5f6f8; }
 .page-content { flex: 1; min-width: 0; overflow: auto; padding: 24px; }
+.page-content--flush { padding: 0; }
 </style>

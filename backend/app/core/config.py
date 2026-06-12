@@ -46,11 +46,22 @@ class Settings(BaseSettings):
     llm_model: str = "deepseek-chat"
     llm_temperature: float = 0.1
     llm_max_tokens: int = 4096
+    llm_system_role_support: bool = True
 
     # 安全
     approval_timeout: int = 120
     max_conversation_rounds: int = 20
-    tool_default_timeout: int = 60
+    react_max_rounds: int = 5
+    max_user_input_length: int = 8192
+    tool_default_timeout: int = 30
+    enable_diagnostic_plan: bool = True
+    workflow_lightweight_confidence: float = 0.9
+    workflow_plan_confidence: float = 0.7
+    approval_timeout_hours: int = 24
+    command_max_retries: int = 2
+    network_retry_interval_sec: int = 5
+    # True 时 POST /chat/send 走 LangGraph 编排；False 走 chat_service（默认，功能更完整）
+    use_langgraph_orchestrator: bool = False
 
     # SMTP
     smtp_host: str = "smtp.qq.com"
@@ -64,7 +75,7 @@ class Settings(BaseSettings):
     # SSH
     ssh_host: str = "192.168.163.15"
     ssh_port: int = 22
-    ssh_user: str = "root"
+    ssh_user: str = "ty"
     ssh_key_path: str = "~/.ssh/id_rsa"
     ssh_timeout: int = 15
 

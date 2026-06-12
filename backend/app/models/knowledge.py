@@ -20,5 +20,7 @@ class KnowledgeArticle(Base):
     source = Column(String(64), default="manual")  # manual / agent_generated / imported
     severity = Column(String(16), default="info")  # info / warning / critical
     view_count = Column(Integer, default=0)
+    like_count = Column(Integer, default=0)
+    favorite_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

@@ -21,7 +21,7 @@ async def init_servers():
             name="麒麟服务器1",
             host="192.168.163.15",
             port=22,
-            username="root",
+            username="ty",
             key_path="~/.ssh/id_rsa",
             description="麒麟操作系统 - 主要运维服务器",
             tags="麒麟,生产环境,运维",

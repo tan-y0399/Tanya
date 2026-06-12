@@ -3,16 +3,15 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import event
 from .config import settings
 
-# SQLite 需要额外参数，PostgreSQL 不需要
-_connect_args = {}
-if "sqlite" in settings.database_url:
-    _connect_args["timeout"] = 10
-
 # 根据数据库类型构建引擎参数
 _engine_kwargs = {
     "echo": False,
-    "connect_args": _connect_args if _connect_args else {},
 }
+
+if "sqlite" in settings.database_url:
+    _engine_kwargs["connect_args"] = {"timeout": 10}
+elif "postgresql" in settings.database_url:
+    _engine_kwargs["connect_args"] = {"ssl": False}
 
 # 仅 PostgreSQL 支持连接池参数（多用户局域网访问需更大池）
 if "postgresql" in settings.database_url:

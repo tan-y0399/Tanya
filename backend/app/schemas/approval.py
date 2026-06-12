@@ -23,3 +23,9 @@ class ApproveRequest(BaseModel):
 
 class RejectRequest(BaseModel):
     reason: str = ""
+
+
+class UpdateApprovalRequest(BaseModel):
+    detail: Optional[str] = None
+    comment: Optional[str] = None
+    riskLevel: Optional[str] = None

@@ -1,4 +1,5 @@
 """运维仪表盘 API —— 从远程麒麟VM获取真实系统数据"""
+import os
 import re
 import json
 import asyncio
@@ -24,9 +25,18 @@ SSH_CALL_TIMEOUT = 3
 
 # 内存缓存（仪表盘数据过期时间）
 _CACHE_TTL = 10  # 秒（实时趋势）
+HISTORY_WINDOW_MINUTES = 20
+HISTORY_SAMPLE_INTERVAL_SEC = 10
+HISTORY_MAX_POINTS = (HISTORY_WINDOW_MINUTES * 60) // HISTORY_SAMPLE_INTERVAL_SEC
+
+_BACKEND_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+_HISTORY_DIR = os.path.join(_BACKEND_ROOT, "data")
+_HISTORY_FILE = os.path.join(_HISTORY_DIR, "dashboard_history.json")
+
 _history_cache = {}
 _metrics_cache: dict = {}
 _services_cache: dict = {}
+_history_loaded = False
 
 
 def _parse_kv(text: str) -> dict:
@@ -60,6 +70,27 @@ def _uptime_to_chinese(raw_uptime: str) -> str:
     return raw if raw else "N/A"
 
 
+def _uptime_seconds_to_chinese(total_sec: int) -> str:
+    if total_sec <= 0:
+        return "N/A"
+    d = total_sec // 86400
+    rem = total_sec % 86400
+    h = rem // 3600
+    rem %= 3600
+    m = rem // 60
+    s = rem % 60
+    parts: list[str] = []
+    if d:
+        parts.append(f"{d}天")
+    if h:
+        parts.append(f"{h}小时")
+    if m:
+        parts.append(f"{m}分钟")
+    if s or not parts:
+        parts.append(f"{s}秒")
+    return " ".join(parts)
+
+
 def _service_uptime_to_chinese(raw_since: str) -> str:
     if not raw_since or raw_since == "N/A":
         return "N/A"
@@ -73,6 +104,7 @@ def _service_uptime_to_chinese(raw_since: str) -> str:
 
 
 def _get_history_cache(server_id: str):
+    _ensure_history_loaded()
     key = server_id or "default"
     if key not in _history_cache:
         _history_cache[key] = {
@@ -81,32 +113,142 @@ def _get_history_cache(server_id: str):
     return _history_cache[key]
 
 
-def _update_history(server_id: str, current_metrics: dict):
-    cache = _get_history_cache(server_id)
-    now = datetime.utcnow()
-    time_label = now.strftime("%H:%M")
+def _ensure_history_loaded() -> None:
+    global _history_loaded
+    if _history_loaded:
+        return
+    _history_loaded = True
+    if not os.path.isfile(_HISTORY_FILE):
+        return
+    try:
+        with open(_HISTORY_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            for key, entry in raw.items():
+                if not isinstance(entry, dict):
+                    continue
+                _history_cache[key] = {
+                    "cpu": entry.get("cpu") or [],
+                    "memory": entry.get("memory") or [],
+                    "disk": entry.get("disk") or [],
+                    "updated_at": entry.get("updated_at"),
+                }
+                _trim_history(_history_cache[key])
+    except Exception as e:
+        logger.warning("Failed to load dashboard history: %s", e)
 
-    for key in ["cpu", "memory", "disk"]:
+
+def _persist_history_cache() -> None:
+    try:
+        os.makedirs(_HISTORY_DIR, exist_ok=True)
+        payload = {}
+        for key, entry in _history_cache.items():
+            payload[key] = {
+                "cpu": entry.get("cpu", []),
+                "memory": entry.get("memory", []),
+                "disk": entry.get("disk", []),
+                "updated_at": entry.get("updated_at").isoformat()
+                if isinstance(entry.get("updated_at"), datetime)
+                else entry.get("updated_at"),
+            }
+        with open(_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning("Failed to persist dashboard history: %s", e)
+
+
+def _trim_history(cache: dict) -> None:
+    cutoff = datetime.now().timestamp() - HISTORY_WINDOW_MINUTES * 60
+    for key in ("cpu", "memory", "disk"):
+        series = cache.get(key) or []
+        trimmed = []
+        for point in series:
+            ts = point.get("ts")
+            if ts is None:
+                continue
+            if float(ts) >= cutoff:
+                trimmed.append(point)
+        if len(trimmed) > HISTORY_MAX_POINTS:
+            trimmed = trimmed[-HISTORY_MAX_POINTS:]
+        cache[key] = trimmed
+
+
+def _history_is_empty(cache: dict) -> bool:
+    return not any(cache.get(k) for k in ("cpu", "memory", "disk"))
+
+
+def _extract_metric_values(current_metrics: dict) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for key in ("cpu", "memory", "disk"):
         raw = current_metrics.get(key, {})
         data = raw.get("data", {}) if isinstance(raw, dict) and raw.get("success") else (raw or {})
-        if data:
-            if key == "cpu":
-                val = float(data.get("cpu_usage", 0))
-            elif key == "memory":
-                total = int(float(data.get("mem_total_mb", 1)))
-                used = int(float(data.get("mem_used_mb", 0)))
-                val = round(used / total * 100, 1) if total > 0 else 0
-            else:  # disk
-                disks = data.get("disks", [])
-                root = disks[0] if disks else {}
-                val = float(str(root.get("use_percent", "0%")).replace("%", ""))
-            cache[key].append({"time": time_label, "value": val})
+        if not data:
+            continue
+        if key == "cpu":
+            values[key] = float(data.get("cpu_usage", 0))
+        elif key == "memory":
+            total = int(float(data.get("mem_total_mb", 1)))
+            used = int(float(data.get("mem_used_mb", 0)))
+            values[key] = round(used / total * 100, 1) if total > 0 else 0
+        else:
+            disks = data.get("disks", [])
+            root = disks[0] if disks else {}
+            values[key] = float(str(root.get("use_percent", "0%")).replace("%", ""))
+    return values
 
-    for key in ["cpu", "memory", "disk"]:
-        if len(cache[key]) > 120:
-            cache[key] = cache[key][-120:]
 
+def _append_history_point(cache: dict, key: str, ts: datetime, value: float) -> None:
+    time_label = ts.strftime("%H:%M:%S")
+    series = cache.setdefault(key, [])
+    if series:
+        last_ts = series[-1].get("ts")
+        if last_ts is not None and ts.timestamp() - float(last_ts) < 5:
+            series[-1] = {"ts": ts.timestamp(), "time": time_label, "value": value}
+            return
+    series.append({"ts": ts.timestamp(), "time": time_label, "value": value})
+
+
+def _seed_history(server_id: str, current_metrics: dict) -> None:
+    """无历史数据时，用当前指标回填近 20 分钟时间轴，避免图表空白。"""
+    cache = _get_history_cache(server_id)
+    if not _history_is_empty(cache):
+        return
+    values = _extract_metric_values(current_metrics)
+    if not values:
+        return
+    now = datetime.now()
+    for i in range(HISTORY_MAX_POINTS - 1, -1, -1):
+        ts = now - timedelta(seconds=i * HISTORY_SAMPLE_INTERVAL_SEC)
+        for key, val in values.items():
+            _append_history_point(cache, key, ts, val)
+    _trim_history(cache)
     cache["updated_at"] = now
+    _persist_history_cache()
+    logger.info("Seeded dashboard history for %s (%d points)", server_id or "default", HISTORY_MAX_POINTS)
+
+
+def _update_history(server_id: str, current_metrics: dict):
+    cache = _get_history_cache(server_id)
+    now = datetime.now()
+    values = _extract_metric_values(current_metrics)
+    if not values:
+        return
+    for key, val in values.items():
+        _append_history_point(cache, key, now, val)
+
+    _trim_history(cache)
+    cache["updated_at"] = now
+    _persist_history_cache()
+
+
+def _history_for_response(server_id: str) -> dict:
+    cache = _get_history_cache(server_id)
+    _trim_history(cache)
+    return {
+        "cpu": list(cache.get("cpu") or []),
+        "memory": list(cache.get("memory") or []),
+        "disk": list(cache.get("disk") or []),
+    }
 
 
 def _call_ssh_with_timeout(func, *args, **kwargs):
@@ -254,8 +396,20 @@ async def dashboard_overview(server_id: str = None, db: AsyncSession = Depends(g
             fresh_data = True
 
     if fresh_data:
+        cache = _get_history_cache(server_id)
+        if _history_is_empty(cache):
+            _seed_history(server_id, vm_metrics)
         _update_history(server_id, vm_metrics)
-    cache = _get_history_cache(server_id)
+    else:
+        cache = _get_history_cache(server_id)
+        has_metrics = any(
+            isinstance(vm_metrics.get(k, {}), dict) and vm_metrics.get(k, {}).get("success")
+            for k in ["cpu", "memory", "disk"]
+        )
+        if has_metrics and _history_is_empty(cache):
+            _seed_history(server_id, vm_metrics)
+
+    history = _history_for_response(server_id)
 
     def _extract(raw):
         if isinstance(raw, dict) and raw.get("success"):
@@ -266,6 +420,14 @@ async def dashboard_overview(server_id: str = None, db: AsyncSession = Depends(g
     mem = _extract(vm_metrics.get("memory", {}))
     disk = _extract(vm_metrics.get("disk", {}))
     sys_info = _extract(vm_metrics.get("system", {}))
+
+    uptime_seconds = 0
+    uptime_sec_raw = str(sys_info.get("uptime_sec", "") or "").strip()
+    if uptime_sec_raw:
+        try:
+            uptime_seconds = int(float(uptime_sec_raw))
+        except (TypeError, ValueError):
+            uptime_seconds = 0
 
     cpu_usage = float(cpu.get("cpu_usage", 0))
     loads = (cpu.get("load_1_5_15", "0,0,0") or "0,0,0").split(",")
@@ -285,7 +447,10 @@ async def dashboard_overview(server_id: str = None, db: AsyncSession = Depends(g
                 "totalOperations": total_audit,
                 "todayOperations": today_audit,
                 "pendingApprovals": pending_approvals,
-                "systemUptime": _uptime_to_chinese(sys_info.get("uptime", "")),
+                "systemUptime": _uptime_seconds_to_chinese(uptime_seconds)
+                if uptime_seconds
+                else _uptime_to_chinese(sys_info.get("uptime", "")),
+                "systemUptimeSeconds": uptime_seconds,
                 "mcpToolsOnline": sum(1 for s in services if s["status"] == "running"),
                 "mcpToolsTotal": len(services),
             },
@@ -296,21 +461,21 @@ async def dashboard_overview(server_id: str = None, db: AsyncSession = Depends(g
                     "load1": float(loads[0] or 0),
                     "load5": float(loads[1] or 0) if len(loads) > 1 else 0,
                     "load15": float(loads[2] or 0) if len(loads) > 2 else 0,
-                    "history": cache.get("cpu", []),
+                    "history": history.get("cpu", []),
                 },
                 "memory": {
                     "current": mem_pct,
                     "total_mb": mem_total,
                     "used_mb": mem_used,
                     "available_mb": int(float(mem.get("mem_available_mb", 0))),
-                    "history": cache.get("memory", []),
+                    "history": history.get("memory", []),
                 },
                 "disk": {
                     "current": disk_pct,
                     "size": root_disk.get("size", "N/A"),
                     "used": root_disk.get("used", "N/A"),
                     "available": root_disk.get("available", "N/A"),
-                    "history": cache.get("disk", []),
+                    "history": history.get("disk", []),
                 },
                 "network": vm_metrics.get("network", {}),
             },
@@ -321,7 +486,14 @@ async def dashboard_overview(server_id: str = None, db: AsyncSession = Depends(g
 
 
 @router.get("/history")
-async def metric_history(server_id: str = None, metric: str = "cpu", hours: int = 24):
-    cache = _get_history_cache(server_id)
-    data = cache.get(metric, [])
-    return {"code": 0, "data": {"metric": metric, "history": data}}
+async def metric_history(server_id: str = None, metric: str = "cpu", minutes: int = HISTORY_WINDOW_MINUTES):
+    history = _history_for_response(server_id)
+    data = history.get(metric, [])
+    return {
+        "code": 0,
+        "data": {
+            "metric": metric,
+            "windowMinutes": minutes,
+            "history": data,
+        },
+    }

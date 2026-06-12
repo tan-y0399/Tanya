@@ -1,7 +1,8 @@
 import uuid
 from datetime import datetime, timedelta
-from sqlalchemy import Column, String, DateTime, Text
+from sqlalchemy import Column, String, DateTime
 from app.core.database import Base
+from app.models.json_type import JSONType
 
 
 def gen_id() -> str:
@@ -15,7 +16,7 @@ class Approval(Base):
     trace_id = Column(String(64), nullable=False, index=True)
     session_id = Column(String(24), nullable=True)
     tool_name = Column(String(128), nullable=False)
-    tool_params_json = Column(Text, nullable=True)
+    tool_params_json = Column(JSONType, nullable=True)
     risk_level = Column(String(4), nullable=False)
     detail = Column(String(500), default="")
     requested_by = Column(String(64), nullable=False)

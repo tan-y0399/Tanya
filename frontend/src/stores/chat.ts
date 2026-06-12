@@ -1,5 +1,10 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
+import {
+  isLightweightConclusion,
+  splitConclusionAndReport,
+  stripLightweightConclusion,
+} from '@/utils/conclusionContent'
 
 export interface Message {
   id: string
@@ -15,8 +20,9 @@ export interface ToolCall {
   toolName: string
   params: Record<string, any>
   riskLevel?: 'L1' | 'L2' | 'L3' | 'L4' | 'L5'
-  status: 'executing' | 'completed' | 'rejected' | 'timeout' | 'blocked' | 'pending_approval' | 'pending_confirm'
+  status: 'executing' | 'completed' | 'failed' | 'rejected' | 'timeout' | 'blocked' | 'pending_approval' | 'pending_confirm'
   result?: any
+  displaySummary?: string
 }
 
 export interface Session {
@@ -32,6 +38,13 @@ export interface ReasoningStep {
   thought?: string
   action?: string
   observation?: string
+}
+
+export interface ExploringStep {
+  id: string
+  title: string
+  detail?: string
+  status: 'running' | 'done' | 'error'
 }
 
 export interface StateCard {
@@ -63,6 +76,8 @@ export const useChatStore = defineStore('chat', () => {
 
   // 推理链
   const reasoningSteps = ref<ReasoningStep[]>([])
+  // Exploring 思考过程
+  const exploringSteps = ref<ExploringStep[]>([])
   // 状态卡片
   const stateCards = ref<StateCard[]>([])
   // 风险色标
@@ -86,11 +101,43 @@ export const useChatStore = defineStore('chat', () => {
     messages.value.push(msg)
   }
 
-  function appendToLastMessage(token: string) {
-    const last = messages.value[messages.value.length - 1]
-    if (last && last.role === 'assistant') {
-      last.content += token
+  function findLastAssistantMessage(): Message | null {
+    for (let i = messages.value.length - 1; i >= 0; i--) {
+      if (messages.value[i].role === 'assistant') return messages.value[i]
     }
+    return null
+  }
+
+  function appendToLastMessage(token: string) {
+    const m = findLastAssistantMessage()
+    if (m) m.content += token
+  }
+
+  /** 总结阶段流式写入：替换轻量模板结论，保留运维报告附录 */
+  function appendSummaryToken(token: string) {
+    const m = findLastAssistantMessage()
+    if (!m) return
+
+    const { head, conclusion, reportSuffix } = splitConclusionAndReport(m.content)
+    let nextConclusion = conclusion
+
+    if (token.includes('## 执行结论')) {
+      if (isLightweightConclusion(nextConclusion) || nextConclusion.includes('## 执行结论')) {
+        nextConclusion = ''
+      }
+    } else if (!nextConclusion.trim() && token.trim()) {
+      nextConclusion = ''
+    }
+
+    nextConclusion += token
+    m.content = head ? head + nextConclusion + reportSuffix : m.content + token
+  }
+
+  /** 总结开始前清除前端补全的轻量结论，为 LLM 流式输出腾出空间 */
+  function prepareSummaryStream() {
+    const m = findLastAssistantMessage()
+    if (!m) return
+    m.content = stripLightweightConclusion(m.content)
   }
 
   function setStreaming(val: boolean) {
@@ -102,10 +149,29 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   const currentIntent = ref<string | null>(null)
+  const intentLabel = ref<string>('')
+  const intentConfidence = ref<number>(0)
+  const responsePhase = ref<string>('')
+  const responsePhaseMessage = ref<string>('')
   const injectionWarning = ref<string | null>(null)
 
   function setCurrentIntent(intent: string | null) {
     currentIntent.value = intent
+  }
+
+  function setIntentResolved(payload: {
+    intent?: string
+    label?: string
+    confidence?: number
+  }) {
+    if (payload.intent) currentIntent.value = payload.intent
+    intentLabel.value = payload.label || payload.intent || ''
+    intentConfidence.value = payload.confidence ?? 0
+  }
+
+  function setResponsePhase(phase: string, message = '') {
+    responsePhase.value = phase
+    responsePhaseMessage.value = message
   }
 
   function setInjectionWarning(warning: string | null) {
@@ -119,6 +185,19 @@ export const useChatStore = defineStore('chat', () => {
 
   function addReasoningStep(step: ReasoningStep) {
     reasoningSteps.value.push(step)
+  }
+
+  function upsertExploringStep(step: ExploringStep) {
+    const idx = exploringSteps.value.findIndex(s => s.id === step.id)
+    if (idx >= 0) {
+      exploringSteps.value[idx] = { ...exploringSteps.value[idx], ...step }
+    } else {
+      exploringSteps.value.push(step)
+    }
+  }
+
+  function setExploringSteps(steps: ExploringStep[]) {
+    exploringSteps.value = steps
   }
 
   // 状态卡片操作
@@ -138,20 +217,27 @@ export const useChatStore = defineStore('chat', () => {
   // 重置所有临时状态
   function resetAgentState() {
     reasoningSteps.value = []
+    exploringSteps.value = []
     stateCards.value = []
     riskColor.value = 'blue'
     currentStage.value = ''
     currentIntent.value = null
+    intentLabel.value = ''
+    intentConfidence.value = 0
+    responsePhase.value = ''
+    responsePhaseMessage.value = ''
     injectionWarning.value = null
   }
 
   return {
     sessions, currentSessionId, messages, isStreaming, currentTraceId,
     setSessions, setCurrentSession, setMessages, addMessage, appendToLastMessage,
+    appendSummaryToken, prepareSummaryStream,
     setStreaming, setCurrentTraceId,
-    currentIntent, injectionWarning, setCurrentIntent, setInjectionWarning,
-    reasoningSteps, stateCards, riskColor, currentStage,
-    setReasoningSteps, addReasoningStep, setStateCards, setRiskColor,
-    setCurrentStage, resetAgentState,
+    currentIntent, intentLabel, intentConfidence, responsePhase, responsePhaseMessage,
+    injectionWarning, setCurrentIntent, setIntentResolved, setResponsePhase, setInjectionWarning,
+    reasoningSteps, exploringSteps, stateCards, riskColor, currentStage,
+    setReasoningSteps, addReasoningStep, upsertExploringStep, setExploringSteps,
+    setStateCards, setRiskColor, setCurrentStage, resetAgentState,
   }
 })

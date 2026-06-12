@@ -1,6 +1,6 @@
 <template>
   <div class="chat-input-area">
-    <div class="input-wrapper">
+    <div class="input-wrapper" :class="{ 'input-wrapper--multiline': isMultiline }">
       <textarea
         ref="inputRef"
         v-model="inputText"
@@ -36,7 +36,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, nextTick } from 'vue'
+import { ref, nextTick, onMounted } from 'vue'
 
 defineProps<{ isStreaming: boolean }>()
 const emit = defineEmits<{
@@ -46,14 +46,19 @@ const emit = defineEmits<{
 
 const inputRef = ref<HTMLTextAreaElement>()
 const inputText = ref('')
+const isMultiline = ref(false)
+
+const INPUT_MIN_HEIGHT = 24
+const INPUT_MAX_HEIGHT = 120
 
 function autoResize() {
   nextTick(() => {
     const el = inputRef.value
-    if (el) {
-      el.style.height = 'auto'
-      el.style.height = Math.min(el.scrollHeight, 120) + 'px'
-    }
+    if (!el) return
+    el.style.height = 'auto'
+    const next = Math.min(Math.max(el.scrollHeight, INPUT_MIN_HEIGHT), INPUT_MAX_HEIGHT)
+    el.style.height = `${next}px`
+    isMultiline.value = next > INPUT_MIN_HEIGHT + 6
   })
 }
 
@@ -68,6 +73,8 @@ function send() {
 function stop() {
   emit('stop')
 }
+
+onMounted(autoResize)
 </script>
 
 <style lang="scss" scoped>
@@ -79,16 +86,22 @@ function stop() {
 
 .input-wrapper {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   gap: 10px;
-  padding: 8px 14px;
+  padding: 10px 12px 10px 16px;
+  min-height: 52px;
   background: #ffffff;
   border: 1px solid #e2e8f0;
-  border-radius: 12px;
+  border-radius: 14px;
   transition: all 0.2s;
   &:focus-within {
     border-color: #2563eb;
     box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.06);
+  }
+
+  &--multiline {
+    align-items: flex-end;
+    padding-bottom: 8px;
   }
 }
 
@@ -102,8 +115,16 @@ function stop() {
   line-height: 1.5;
   resize: none;
   outline: none;
+  min-height: 24px;
   max-height: 120px;
-  &::placeholder { color: #94a3b8; }
+  padding: 4px 0;
+  margin: 0;
+  box-sizing: border-box;
+  vertical-align: middle;
+  &::placeholder {
+    color: #94a3b8;
+    line-height: 1.5;
+  }
   &:disabled { opacity: 0.5; }
 }
 
