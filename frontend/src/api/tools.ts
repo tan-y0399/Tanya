@@ -41,3 +41,20 @@ export async function batchUpdateTools(updates: { id: string; enabled: boolean }
   const { data } = await api.put('/tools/batch', { updates })
   return data
 }
+
+export interface ToolFileValidation {
+  ok: boolean
+  stage: string
+  name: string
+  description?: string
+  category?: string
+  riskLevel?: number
+  config?: Record<string, any>
+  diagnose?: { ok: boolean; messages: string[]; errors: string[] }
+  trial?: { ok: boolean; error?: string; result?: Record<string, any> }
+}
+
+export async function validateToolFile(filename: string, content: string): Promise<ToolFileValidation> {
+  const { data } = await api.post('/tools/validate-file', { filename, content })
+  return data.data
+}

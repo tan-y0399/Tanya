@@ -1,0 +1,20 @@
+{
+  "name": "get_user_account_info",
+  "description": "生成查询指定用户 UID、GID、家目录、登录 Shell、账户过期信息的远程命令。用于密码重置前确认目标用户存在且信息正确。",
+  "category": "system_operation",
+  "riskLevel": 1,
+  "enabled": true,
+  "trialArgs": {
+    "username": "kylin"
+  },
+  "config": {
+    "handler": "password_recovery",
+    "parameters": {
+      "username": {
+        "type": "string",
+        "required": true
+      }
+    }
+  },
+  "python": "\"\"\"KylinOps 工具：get_user_account_info — 查询指定 Linux 用户账户信息\"\"\"\nNAME = \"get_user_account_info\"\nDESCRIPTION = (\n    \"生成查询指定用户 UID、GID、家目录、登录 Shell、账户过期信息的远程命令。\"\n    \"用于密码重置前确认目标用户存在且信息正确。\"\n)\nCATEGORY = \"system_operation\"\nRISK_LEVEL = 1\n\nTRIAL_ARGS = {\"username\": \"kylin\"}\n\n\ndef _cmds(username: str):\n    u = username.replace(\"'\", \"\")\n    return [\n        {\"command\": f\"getent passwd {u}\", \"purpose\": \"基础账户信息（用户:密码占位:UID:GID:描述:家目录:Shell）\"},\n        {\"command\": f\"id {u}\", \"purpose\": \"UID/GID 及所属组\"},\n        {\"command\": f\"chage -l {u} 2>/dev/null || echo 'chage-not-available'\", \"purpose\": \"密码过期与锁定策略\"},\n        {\"command\": f\"test -d $(getent passwd {u} | cut -d: -f6) && echo homedir-ok || echo homedir-missing\", \"purpose\": \"家目录是否存在\"},\n    ]\n\n\ndef _parse_hints():\n    return {\n        \"getent_missing\": \"用户不存在，请核对用户名或是否仅为系统用户\",\n        \"homedir_missing\": \"家目录缺失可能导致登录异常，重置密码后仍需修复目录\",\n        \"shell_nologin\": \"Shell 为 /sbin/nologin 时无法交互登录\",\n    }\n\n\ndef run(**kwargs):\n    username = (kwargs.get(\"username\") or kwargs.get(\"user\") or \"\").strip()\n    if not username:\n        return {\"success\": False, \"error\": \"请提供 username 参数\"}\n\n    return {\n        \"success\": True,\n        \"data\": {\n            \"tool\": NAME,\n            \"execution_mode\": \"remote_ssh\",\n            \"username\": username,\n            \"commands\": _cmds(username),\n            \"parse_hints\": _parse_hints(),\n            \"agent_instruction\": \"通过 execute_command 执行 commands，解析 getent passwd 输出字段\",\n            \"trial_simulated\": {\n                \"username\": username,\n                \"uid\": 1000,\n                \"home\": f\"/home/{username}\",\n                \"shell\": \"/bin/bash\",\n                \"exists\": True,\n            },\n            \"summary\": f\"已生成用户「{username}」账户信息查询命令\",\n        },\n    }\n"
+}

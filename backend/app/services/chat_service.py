@@ -15,6 +15,9 @@ from app.core.config import settings
 from app.core.trace import generate_trace_id
 from app.core.command_security import analyze_command, RiskLevel, get_risk_level_info
 from app.services.tool_definitions import TOOLS, SYSTEM_PROMPT
+
+# 当前会话绑定的自定义工具注册表（供 execute / risk / LLM tools 使用）
+_ACTIVE_CUSTOM_REGISTRY = None
 from app.services.intent_router import intent_router, IntentType
 from app.services.performance_telemetry import TraceTelemetry, record_trace
 from app.services.security_workflow import _detect_prompt_injection  # 保留兼容
@@ -30,6 +33,11 @@ def execute_tool(name: str, args: dict) -> dict:
     return _finalize_tool_result(name, _execute_tool_core(name, args))
 
 
+def set_active_custom_registry(registry) -> None:
+    global _ACTIVE_CUSTOM_REGISTRY
+    _ACTIVE_CUSTOM_REGISTRY = registry
+
+
 def _execute_tool_core(name: str, args: dict) -> dict:
     """执行工具调用，通过 MCP 协议转发到远程麒麟VM执行。
 
@@ -41,6 +49,12 @@ def _execute_tool_core(name: str, args: dict) -> dict:
     from app.services.tool_args import normalize_tool_args, resolve_remote_tool_name
 
     args = normalize_tool_args(name, args)
+
+    global _ACTIVE_CUSTOM_REGISTRY
+    if _ACTIVE_CUSTOM_REGISTRY and name in _ACTIVE_CUSTOM_REGISTRY.tools:
+        custom_result = _ACTIVE_CUSTOM_REGISTRY.execute(name, args)
+        if custom_result is not None:
+            return custom_result
 
     # ── 通过 MCP registry 查找工具定义 ──
     try:
@@ -215,6 +229,28 @@ async def _yield_plan_final_summary_events(
     if not tool_call_records:
         return
 
+    if _plan_has_pending_actions(tool_call_records):
+        logger.info("skip plan final summary: pending approval/confirm still open")
+        return
+    if _filter_actionable_pending_records(tool_call_records):
+        logger.info("skip plan final summary: actionable pending records exist")
+        return
+
+    pending_orders = {
+        int(r["planStepOrder"]) for r in tool_call_records
+        if r.get("planStepOrder") is not None
+        and r.get("status") in ("pending_approval", "pending_confirm")
+    }
+    if pending_orders:
+        return
+
+    steps = (plan_data or {}).get("steps") or []
+    if steps:
+        done = _infer_done_plan_orders(plan_data or {}, tool_call_records)
+        if len(done) < len(steps):
+            logger.info("skip plan final summary: %s/%s steps done", len(done), len(steps))
+            return
+
     yield response_phase(PHASE_SUMMARY, "正在生成执行结论…")
     yield _sse_exploring("summary", "生成执行结论", "分析工具结果并撰写总结")
     yield {"event": "summary_start", "data": json.dumps({"title": "执行结论"})}
@@ -359,6 +395,10 @@ def get_tool_risk_level(name: str, args: dict = None) -> str:
         action = args.get("action", "").lower()
         return "L4" if action in ("stop", "restart", "reload") else "L2"
 
+    global _ACTIVE_CUSTOM_REGISTRY
+    if _ACTIVE_CUSTOM_REGISTRY and name in _ACTIVE_CUSTOM_REGISTRY.tools:
+        return _ACTIVE_CUSTOM_REGISTRY.get_risk_level(name)
+
     return risk_map.get(name, "L2")
 
 
@@ -376,6 +416,45 @@ def _pre_state_for_write(
         return capture_pre_command_state(server_id)
     except Exception:
         return None
+
+
+async def _record_blocked_injection_audit(
+    db,
+    *,
+    trace_id: str,
+    session_id: str,
+    user_id: str,
+    reason: str,
+    severity: str = "high",
+    stage: str = "prompt_injection",
+    extra: dict = None,
+) -> None:
+    """入口安全闸门阻断时写入 blocked_injection 审计（供审计中心「安全拦截」Tab 展示）。"""
+    try:
+        from app.models.audit import AuditRecord
+        payload = {
+            "reason": reason,
+            "severity": severity,
+            "stage": stage,
+            "flow_status": "blocked",
+            **(extra or {}),
+        }
+        audit = AuditRecord(
+            trace_id=trace_id,
+            session_id=session_id,
+            user_id=user_id,
+            event_type="blocked_injection",
+            summary=f"注入拦截 [{severity}]: {(reason or '')[:100]}",
+            risk_level="L5",
+            detail_json=json.dumps(payload, ensure_ascii=False, default=str),
+        )
+        db.add(audit)
+        await db.commit()
+    except Exception:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
 
 
 async def _record_write_execution(
@@ -412,6 +491,17 @@ def _check_tool_safety(tool_name: str, tool_args: dict) -> dict:
       L4 🟠→🔴: 高风险，需管理员审批
       L5 🔴: 致命风险，需管理员审批/禁止
     """
+    # 自定义工具 run() 仅在本地生成命令/手册，真实风险由后续 execute_command 评估
+    if _is_registered_custom_tool(tool_name):
+        return {
+            "safe": True,
+            "blocked": False,
+            "block_message": None,
+            "require_approval": False,
+            "require_confirm": False,
+            "risk_level": "L1",
+        }
+
     risk = get_tool_risk_level(tool_name, tool_args)
 
     result = {
@@ -441,30 +531,23 @@ def _check_tool_safety(tool_name: str, tool_args: dict) -> dict:
             result["risk_level"] = analysis.get("risk_level", risk)
             return result
 
-        if analysis.get("require_approval"):
+        ar = analysis.get("risk_level", "L1")
+        result["risk_level"] = ar
+
+        # 仅 L4/L5 进管理员审批中心（与产品规则一致）
+        if ar in ("L4", "L5") or (
+            analysis.get("require_approval") and ar in ("L4", "L5")
+        ):
             result["safe"] = False
             result["require_approval"] = True
             result["require_confirm"] = analysis.get("require_confirm", True)
-            result["risk_level"] = analysis.get("risk_level", risk)
             return result
 
-        if analysis.get("require_confirm"):
-            result["safe"] = False
-            result["require_confirm"] = True
-            result["risk_level"] = analysis.get("risk_level", risk)
-            return result
-
-        # 命令分析通过：按分析结果分级（L1 直接执行 / L2 确认 / L3+ 审批）
-        ar = analysis.get("risk_level", "L1")
-        result["risk_level"] = ar
-        if ar in ("L3", "L4", "L5"):
-            result["safe"] = False
-            result["require_approval"] = True
-            return result
-        if ar == "L2":
+        if ar in ("L2", "L3") or analysis.get("require_confirm"):
             result["safe"] = False
             result["require_confirm"] = True
             return result
+
         return result
 
     # L1: 只读，直接执行（非 execute_command）
@@ -612,7 +695,105 @@ def _plan_skip_reason(step: dict, tool_name: str, tool_args: dict, records: list
     return None
 
 
-def _parse_plan_step_to_tool(step: dict) -> Optional[tuple]:
+PASSWORD_CUSTOM_TOOLS = frozenset({
+    "check_ssh_connectivity",
+    "check_console_access_available",
+    "get_user_account_info",
+    "check_account_lock_status",
+    "get_password_policy",
+    "reset_user_password",
+    "verify_account_after_reset",
+    "get_password_recovery_playbook",
+})
+
+
+def _is_registered_custom_tool(name: str) -> bool:
+    global _ACTIVE_CUSTOM_REGISTRY
+    if _ACTIVE_CUSTOM_REGISTRY and name in _ACTIVE_CUSTOM_REGISTRY.tools:
+        return True
+    return name in PASSWORD_CUSTOM_TOOLS
+
+
+def _extract_password_recovery_context(plan_data: dict) -> dict:
+    """从用户诉求中提取密码找回相关参数。"""
+    text = " ".join(
+        filter(None, [
+            plan_data.get("phenomenon"),
+            plan_data.get("query_goal"),
+        ])
+    )
+    ctx: dict = {}
+    skip_words = {"密码", "忘记", "找回", "重置", "修改", "用户", "账户", "账号", "login", "password", "root", "admin"}
+    for pat in (
+        r"用户\s*[`'\"]?([a-zA-Z_][a-zA-Z0-9_-]{0,31})[`'\"]?",
+        r"[`'\"]?([a-zA-Z_][a-zA-Z0-9_-]{0,31})[`'\"]?\s*(?:用户|账户|账号)",
+        r"(?:账户|账号)\s*[`'\"]?([a-zA-Z_][a-zA-Z0-9_-]{0,31})[`'\"]?",
+        r"(?:user|account)\s+[`'\"]?([a-zA-Z_][a-zA-Z0-9_-]{0,31})[`'\"]?",
+    ):
+        m = re.search(pat, text, re.I)
+        if m:
+            u = m.group(1)
+            if u.lower() not in skip_words:
+                ctx["username"] = u
+                break
+    low = text.lower()
+    if re.search(r"\broot\b", low) or "root" in text:
+        ctx.setdefault("username", "root")
+    ctx.setdefault("username", "root")
+    return ctx
+
+
+def _generate_temp_password(username: str = "") -> str:
+    import secrets
+    suffix = secrets.token_urlsafe(4).replace("-", "")[:6]
+    return f"Kylin@{suffix}!1"
+
+
+def _build_custom_tool_args(tool_name: str, step: dict, plan_data: dict) -> dict:
+    """为自定义工具构造 run() 参数。"""
+    pw = _extract_password_recovery_context(plan_data or {})
+    username = pw.get("username", "root")
+    args: dict = {}
+
+    if tool_name in {
+        "get_user_account_info",
+        "check_account_lock_status",
+        "get_password_policy",
+        "verify_account_after_reset",
+        "get_password_recovery_playbook",
+        "reset_user_password",
+    }:
+        args["username"] = username
+
+    if tool_name == "check_ssh_connectivity":
+        args["ssh_user"] = "root"
+    elif tool_name == "check_console_access_available":
+        args["has_console"] = True
+        args["console_type"] = "vmware"
+    elif tool_name == "reset_user_password":
+        args["new_password"] = _generate_temp_password(username)
+        args["dry_run"] = False
+    elif tool_name == "get_password_recovery_playbook":
+        args["system_type"] = "desktop"
+        args["recovery_mode"] = "auto"
+
+    return args
+
+
+def _custom_tool_remote_commands(result: dict) -> List[str]:
+    data = (result or {}).get("data") or {}
+    commands: List[str] = []
+    for item in data.get("commands") or []:
+        if isinstance(item, dict):
+            cmd = (item.get("command") or "").strip()
+        else:
+            cmd = str(item).strip()
+        if cmd:
+            commands.append(cmd)
+    return commands
+
+
+def _parse_plan_step_to_tool(step: dict, plan_data: dict = None) -> Optional[tuple]:
     """将诊断方案步骤解析为 (tool_name, tool_args)。必须与 tool_hint / action 语义一致。"""
     hint = (step.get("tool_hint") or "").strip()
     if not hint or hint in ("env_precheck", "按意图选择工具", "summary") or step.get("virtual"):
@@ -721,6 +902,11 @@ def _parse_plan_step_to_tool(step: dict) -> Optional[tuple]:
                 return ("manage_service", {"action": parts[0], "service_name": parts[1]})
             if parts[1] in ("start", "stop", "restart", "status", "enable", "disable"):
                 return ("manage_service", {"action": parts[1], "service_name": parts[0]})
+
+    hint_name = hint.split()[0].strip("`'\"")
+    if _is_registered_custom_tool(hint_name):
+        return (hint_name, _build_custom_tool_args(hint_name, step, plan_data or {}))
+
     return None
 
 
@@ -814,17 +1000,29 @@ def _infer_done_plan_orders(plan_data: dict, tool_call_records: list) -> set:
     terminal = {"completed", "failed", "blocked", "rejected", "skipped"}
     done: set = set()
     steps = (plan_data or {}).get("steps") or []
-    for rec in tool_call_records or []:
-        if rec.get("status") not in terminal:
+    all_orders = {int(s.get("order", 0)) for s in steps if s.get("order")}
+
+    for order in all_orders:
+        step_recs = [
+            r for r in (tool_call_records or [])
+            if r.get("planStepOrder") is not None and int(r["planStepOrder"]) == order
+        ]
+        if not step_recs:
             continue
-        order = rec.get("planStepOrder")
-        if order is not None:
-            done.add(int(order))
+        if any(r.get("status") in ("pending_approval", "pending_confirm", "executing") for r in step_recs):
+            continue
+        if any(r.get("status") in terminal for r in step_recs):
+            done.add(order)
             continue
         for step in steps:
-            parsed = _parse_plan_step_to_tool(step)
-            if parsed and _record_matches_plan_tool(rec, parsed[0], parsed[1]):
-                done.add(int(step.get("order", 0)))
+            if int(step.get("order", 0)) != order:
+                continue
+            parsed = _parse_plan_step_to_tool(step, plan_data)
+            if parsed and any(
+                _record_matches_plan_tool(r, parsed[0], parsed[1]) and r.get("status") in terminal
+                for r in step_recs
+            ):
+                done.add(order)
                 break
     return done
 
@@ -887,10 +1085,11 @@ def _apply_plan_step_safety(safety: dict, step: dict) -> dict:
 
     cmd_risk = safety.get("risk_level") or "L1"
     merged_risk = _max_risk_level(hint, cmd_risk)
+    # 管理员审批：仅 L4/L5（L2/L3 对话内确认）
     require_approval = bool(
-        safety.get("require_approval")
-        or merged_risk in ("L3", "L4", "L5")
-        or hint in ("L3", "L4", "L5")
+        safety.get("require_approval") and merged_risk in ("L4", "L5")
+        or merged_risk in ("L4", "L5")
+        or hint in ("L4", "L5")
     )
     require_confirm = bool(
         safety.get("require_confirm")
@@ -963,12 +1162,21 @@ async def _load_all_tool_call_records_for_session(db: AsyncSession, session_id: 
     return merged
 
 
+def _plan_has_pending_actions(tool_call_records: list) -> bool:
+    return any(
+        r.get("status") in ("pending_approval", "pending_confirm", "executing")
+        for r in (tool_call_records or [])
+    )
+
+
 def _plan_has_remaining_steps(planned_ctx: dict) -> bool:
     plan_data = (planned_ctx or {}).get("plan_data") or {}
     steps = plan_data.get("steps") or []
     if not steps:
         return False
     records = (planned_ctx or {}).get("records") or []
+    if _plan_has_pending_actions(records):
+        return True
     done_orders = _infer_done_plan_orders(plan_data, records)
     for step in steps:
         order = int(step.get("order", 0))
@@ -987,6 +1195,10 @@ def _filter_actionable_pending_records(tool_call_records: list) -> list:
     pending = []
     for tc in tool_call_records or []:
         if tc.get("status") not in ("pending_confirm", "pending_approval"):
+            continue
+        # 待管理员审批必须保留，不能被同步骤的「规划类 completed」误过滤
+        if tc.get("status") == "pending_approval":
+            pending.append(tc)
             continue
         step = tc.get("planStepOrder")
         if step is not None and int(step) in done_orders:
@@ -1168,6 +1380,267 @@ async def _fallback_planned_ctx(
         return None
 
 
+async def _stream_plan_execute_command_for_step(
+    db: AsyncSession,
+    session_id: str,
+    trace_id: str,
+    user_id: str,
+    step: dict,
+    plan_data: dict,
+    messages: list,
+    state: dict,
+    command: str,
+    steps_total: int,
+    server_id: str = None,
+):
+    """在方案步骤下执行单条远程命令（含审批/确认流程）。"""
+    tool_name = "execute_command"
+    tool_args = {"command": command}
+    tool_call_id = generate_id()
+    step_order = step.get("order", 0)
+
+    safety = _apply_plan_step_safety(_check_tool_safety(tool_name, tool_args), step)
+    yield {"event": "safety_decision", "data": json.dumps({
+        "toolName": tool_name,
+        "riskLevel": safety["risk_level"],
+        "blocked": safety["blocked"],
+        "requireConfirm": safety["require_confirm"],
+        "requireApproval": safety["require_approval"],
+    }, ensure_ascii=False)}
+
+    if safety["blocked"]:
+        state["records"].append({
+            "id": tool_call_id, "toolName": tool_name, "params": tool_args,
+            "riskLevel": safety["risk_level"], "status": "blocked",
+            "result": {"success": False, "error": safety["block_message"]},
+            "planStepOrder": step_order,
+            "planStepTotal": steps_total,
+            "planStepAction": step.get("action", ""),
+        })
+        return
+
+    if safety["require_approval"]:
+        risk_desc = _build_risk_description(tool_name, tool_args, safety["risk_level"])
+        now = datetime.utcnow()
+        approval = Approval(
+            trace_id=trace_id,
+            session_id=session_id,
+            tool_name=tool_name,
+            tool_params_json=json.dumps(tool_args, ensure_ascii=False),
+            risk_level=safety["risk_level"],
+            detail=risk_desc,
+            requested_by=user_id,
+            expires_at=now + timedelta(seconds=settings.approval_timeout),
+        )
+        db.add(approval)
+        await db.commit()
+        await db.refresh(approval)
+        pe = await _save_pending_execution(
+            db, session_id, trace_id, user_id,
+            tool_name, tool_args, safety["risk_level"],
+            messages_snapshot=_append_planned_resume_snapshot(
+                messages, plan_data, state, step_order,
+            ),
+            need_approval=True,
+            need_confirm=bool(safety.get("require_confirm")),
+            approval_id=approval.id,
+        )
+        yield {"event": "need_approval", "data": json.dumps({
+            "id": tool_call_id,
+            "toolName": tool_name,
+            "params": tool_args,
+            "riskLevel": safety["risk_level"],
+            "approvalId": approval.id,
+            "pendingExecutionId": pe.id,
+            "message": f"{risk_desc}\n请在审批管理页面确认（{settings.approval_timeout}秒超时）",
+            "status": "pending_approval",
+            "commandPreview": preview_tool_command(tool_name, tool_args),
+            "planStepOrder": step_order,
+            "planStepTotal": steps_total,
+            "planStepAction": step.get("action", ""),
+        }, ensure_ascii=False)}
+        state["records"].append({
+            "id": tool_call_id, "toolName": tool_name, "params": tool_args,
+            "riskLevel": safety["risk_level"], "status": "pending_approval",
+            "approvalId": approval.id,
+            "pendingExecutionId": pe.id,
+            "planStepOrder": step_order,
+            "planStepTotal": steps_total,
+            "planStepAction": step.get("action", ""),
+        })
+        state["early_status"] = "awaiting_user_action"
+        state["approval_id"] = approval.id
+        yield {"event": "tool_call", "data": json.dumps({
+            "id": tool_call_id,
+            "toolName": tool_name,
+            "params": tool_args,
+            "riskLevel": safety["risk_level"],
+            "status": "pending_approval",
+            "approvalId": approval.id,
+            "pendingExecutionId": pe.id,
+            "commandPreview": preview_tool_command(tool_name, tool_args),
+            "planStepOrder": step_order,
+            "planStepTotal": steps_total,
+            "planStepAction": step.get("action", ""),
+        }, ensure_ascii=False)}
+        return
+
+    if safety["require_confirm"]:
+        risk_desc = _build_risk_description(tool_name, tool_args, safety["risk_level"])
+        pe = await _save_pending_execution(
+            db, session_id, trace_id, user_id,
+            tool_name, tool_args, safety["risk_level"],
+            messages_snapshot=_append_planned_resume_snapshot(
+                messages, plan_data, state, step_order,
+            ),
+            need_confirm=True,
+        )
+        yield {"event": "tool_call", "data": json.dumps({
+            "id": tool_call_id,
+            "toolName": tool_name,
+            "params": tool_args,
+            "riskLevel": safety["risk_level"],
+            "status": "pending_confirm",
+            "pendingExecutionId": pe.id,
+            "commandPreview": preview_tool_command(tool_name, tool_args),
+            "planStepOrder": step_order,
+            "planStepTotal": steps_total,
+            "planStepAction": step.get("action", ""),
+        }, ensure_ascii=False)}
+        yield {"event": "need_confirm", "data": json.dumps({
+            "id": tool_call_id,
+            "toolName": tool_name,
+            "params": tool_args,
+            "riskLevel": safety["risk_level"],
+            "pendingExecutionId": pe.id,
+            "message": f"{risk_desc}\n请在下方确认后执行。",
+            "status": "pending_confirm",
+            "commandPreview": preview_tool_command(tool_name, tool_args),
+            "planStepOrder": step_order,
+            "planStepTotal": steps_total,
+        }, ensure_ascii=False)}
+        state["records"].append({
+            "id": tool_call_id, "toolName": tool_name, "params": tool_args,
+            "riskLevel": safety["risk_level"], "status": "pending_confirm",
+            "pendingExecutionId": pe.id,
+            "planStepOrder": step_order,
+            "planStepTotal": steps_total,
+            "planStepAction": step.get("action", ""),
+        })
+        state["early_status"] = "awaiting_user_action"
+        return
+
+    yield {"event": "tool_call", "data": json.dumps({
+        "id": tool_call_id,
+        "toolName": tool_name,
+        "params": tool_args,
+        "riskLevel": safety["risk_level"],
+        "status": "executing",
+        "commandPreview": preview_tool_command(tool_name, tool_args),
+        "planStepOrder": step_order,
+        "planStepTotal": steps_total,
+        "planStepAction": step.get("action", ""),
+    }, ensure_ascii=False)}
+    pre_state = _pre_state_for_write(tool_name, tool_args, safety["risk_level"], server_id)
+    cmd_result = execute_tool(tool_name, tool_args)
+    if cmd_result.get("success"):
+        await _record_write_execution(
+            db, session_id, trace_id, tool_name, tool_args, cmd_result,
+            tool_call_id=tool_call_id,
+            risk_level=safety["risk_level"],
+            server_id=server_id,
+            pre_state=pre_state,
+        )
+    rec_status = _plan_step_result_status(tool_name, cmd_result, step)
+    yield {"event": "tool_result", "data": json.dumps({
+        "id": tool_call_id,
+        "toolName": tool_name,
+        "status": rec_status,
+        "result": cmd_result,
+        "displaySummary": cmd_result.get("display_summary", ""),
+    }, ensure_ascii=False)}
+    state["records"].append({
+        "id": tool_call_id, "toolName": tool_name, "params": tool_args,
+        "riskLevel": safety["risk_level"], "status": rec_status, "result": cmd_result,
+        "displaySummary": cmd_result.get("display_summary", ""),
+        "planStepOrder": step_order,
+        "planStepTotal": steps_total,
+        "planStepAction": step.get("action", ""),
+    })
+
+
+async def _stream_custom_tool_plan_step(
+    db: AsyncSession,
+    session_id: str,
+    trace_id: str,
+    user_id: str,
+    step: dict,
+    plan_data: dict,
+    messages: list,
+    state: dict,
+    tool_name: str,
+    tool_args: dict,
+    tool_call_id: str,
+    steps_total: int,
+    server_id: str = None,
+):
+    """自定义工具：本地 run() 生成方案，远程命令单独走 execute_command 审批链。"""
+    step_order = step.get("order", 0)
+    yield {"event": "tool_call", "data": json.dumps({
+        "id": tool_call_id,
+        "toolName": tool_name,
+        "params": tool_args,
+        "riskLevel": "L1",
+        "status": "executing",
+        "commandPreview": preview_tool_command(tool_name, tool_args),
+        "planStepOrder": step_order,
+        "planStepTotal": steps_total,
+        "planStepAction": step.get("action", ""),
+    }, ensure_ascii=False)}
+    result = execute_tool(tool_name, tool_args)
+    rec_status = _plan_step_result_status(tool_name, result, step)
+    remote_cmds = _custom_tool_remote_commands(result) if result.get("success") else []
+    # 本地规划类 run() 不算步骤终态，避免待审批的远程命令被误判为已完成
+    local_status = "planning" if remote_cmds else rec_status
+    yield {"event": "tool_result", "data": json.dumps({
+        "id": tool_call_id,
+        "toolName": tool_name,
+        "status": local_status,
+        "result": result,
+        "displaySummary": result.get("display_summary", ""),
+    }, ensure_ascii=False)}
+    state["records"].append({
+        "id": tool_call_id, "toolName": tool_name, "params": tool_args,
+        "riskLevel": "L1", "status": local_status, "result": result,
+        "displaySummary": result.get("display_summary", ""),
+        "planStepOrder": step_order if not remote_cmds else None,
+        "planStepTotal": steps_total,
+        "planStepAction": step.get("action", ""),
+        "planSubStep": "custom_tool_planning" if remote_cmds else None,
+    })
+
+    if not result.get("success"):
+        yield _sse_exploring(
+            f"plan-{tool_call_id}", f"步骤 {step_order} 失败", tool_name, "error",
+        )
+        return
+
+    if remote_cmds:
+        for cmd in remote_cmds:
+            async for ev in _stream_plan_execute_command_for_step(
+                db, session_id, trace_id, user_id, step, plan_data, messages, state,
+                cmd, steps_total, server_id=server_id,
+            ):
+                yield ev
+            if state.get("early_status"):
+                return
+
+    yield _sse_exploring(
+        f"plan-{tool_call_id}", f"步骤 {step_order} 完成", tool_name,
+        "done" if rec_status == "completed" else "error",
+    )
+
+
 async def _stream_planned_diagnostic_execution(
     db: AsyncSession,
     session_id: str,
@@ -1181,6 +1654,11 @@ async def _stream_planned_diagnostic_execution(
 ):
     """按方案步骤确定性执行工具（不依赖 LLM function calling）。"""
     from app.services.stream_events import response_phase, PHASE_EXECUTE
+    from app.services.custom_tool_registry import load_custom_tool_registry
+
+    global _ACTIVE_CUSTOM_REGISTRY
+    if not _ACTIVE_CUSTOM_REGISTRY:
+        set_active_custom_registry(await load_custom_tool_registry(db))
 
     steps = plan_data.get("steps") or []
     yield response_phase(PHASE_EXECUTE, "按诊断方案逐步执行工具…")
@@ -1189,7 +1667,7 @@ async def _stream_planned_diagnostic_execution(
     for step in sorted(steps, key=lambda s: s.get("order", 0)):
         if step.get("order", 0) <= start_after_order:
             continue
-        parsed = _parse_plan_step_to_tool(step)
+        parsed = _parse_plan_step_to_tool(step, plan_data)
         if not parsed:
             continue
         tool_name, tool_args = parsed
@@ -1210,6 +1688,17 @@ async def _stream_planned_diagnostic_execution(
             })
             continue
         yield _sse_exploring(f"plan-{tool_call_id}", f"方案步骤 {step.get('order')}", tool_name, "running")
+
+        if _is_registered_custom_tool(tool_name):
+            async for ev in _stream_custom_tool_plan_step(
+                db, session_id, trace_id, user_id, step, plan_data, messages, state,
+                tool_name, tool_args, tool_call_id, len(steps), server_id=server_id,
+            ):
+                yield ev
+            if state.get("early_status"):
+                return
+            continue
+
         safety = _apply_plan_step_safety(_check_tool_safety(tool_name, tool_args), step)
         yield {"event": "safety_decision", "data": json.dumps({
             "toolName": tool_name,
@@ -1399,6 +1888,7 @@ async def _stream_planned_diagnostic_execution(
             "planStepTotal": len(steps),
             "planStepAction": step.get("action", ""),
         })
+
         yield _sse_exploring(
             f"plan-{tool_call_id}", f"步骤 {step.get('order')} 完成", tool_name,
             "done" if rec_status == "completed" else "error",
@@ -1407,7 +1897,7 @@ async def _stream_planned_diagnostic_execution(
     from app.services.human_supervision import _is_virtual_plan_step
 
     terminal = {"completed", "failed", "blocked", "rejected", "skipped"}
-    actionable = [s for s in steps if _parse_plan_step_to_tool(s)]
+    actionable = [s for s in steps if _parse_plan_step_to_tool(s, plan_data)]
     actionable_done = actionable and all(
         any(
             r.get("planStepOrder") == s.get("order") and r.get("status") in terminal
@@ -1437,6 +1927,12 @@ async def _stream_planned_diagnostic_execution(
 def preview_tool_command(tool_name: str, tool_args: dict) -> str:
     """生成将在虚拟机上执行的命令预览，供前端确认对话框展示。"""
     args = tool_args or {}
+    if _is_registered_custom_tool(tool_name):
+        summary = args.get("summary") or tool_name
+        if tool_name == "reset_user_password":
+            user = args.get("username") or "?"
+            return f"passwd/chpasswd 重置用户 {user} 的密码"
+        return f"自定义工具 {tool_name}: {summary}"
     if tool_name in ("execute_command", "run_command") and args.get("command"):
         return args["command"]
     if tool_name == "manage_service":
@@ -1860,7 +2356,12 @@ def prepare_messages_for_llm(messages: List[Dict]) -> List[Dict]:
     return remaining
 
 
-async def call_deepseek(messages: List[Dict], stream: bool = True, use_tools: bool = True):
+async def call_deepseek(
+    messages: List[Dict],
+    stream: bool = True,
+    use_tools: bool = True,
+    extra_tools: List[Dict] | None = None,
+):
     """调用 DeepSeek API，带重试逻辑。use_tools=False 时仅文本总结，不触发 function calling。"""
     messages = prepare_messages_for_llm(messages)
     url = f"{settings.llm_api_base}/chat/completions"
@@ -1876,7 +2377,14 @@ async def call_deepseek(messages: List[Dict], stream: bool = True, use_tools: bo
         "stream": stream,
     }
     if use_tools:
-        payload["tools"] = TOOLS
+        merged_tools = list(TOOLS)
+        existing = {t["function"]["name"] for t in merged_tools}
+        for t in extra_tools or []:
+            fn = (t.get("function") or {}).get("name")
+            if fn and fn not in existing:
+                merged_tools.append(t)
+                existing.add(fn)
+        payload["tools"] = merged_tools
         payload["tool_choice"] = "auto"
 
     max_retries = 3
@@ -2092,16 +2600,16 @@ async def _process_message_impl(
             })}
             await save_message(db, session_id, "assistant",
                 f"⚠ {security_result['reason']}", trace_id=trace_id)
-            try:
-                from app.models.audit import AuditRecord
-                audit = AuditRecord(trace_id=trace_id, session_id=session_id,
-                    user_id=user_id, event_type="blocked_injection",
-                    summary=f"注入拦截 [{security_result['severity']}]: {security_result['reason'][:100]}",
-                    risk_level="L5", detail_json=json.dumps(security_result, ensure_ascii=False, default=str))
-                db.add(audit)
-                await db.commit()
-            except Exception:
-                pass
+            await _record_blocked_injection_audit(
+                db,
+                trace_id=trace_id,
+                session_id=session_id,
+                user_id=user_id,
+                reason=security_result.get("reason", ""),
+                severity=security_result.get("severity", "high"),
+                stage="security_gate",
+                extra=security_result,
+            )
             try:
                 from app.services.workflow_audit import finalize_workflow_audit
                 await finalize_workflow_audit(
@@ -2190,6 +2698,34 @@ async def _process_message_impl(
                 "sources": [s["title"] for s in knowledge_rag.search(content, top_k=3)] if knowledge_rag._initialized else [],
             })}
 
+        # ── 工具库检索：判断是否可走可执行方案（而非纯知识问答）──
+        from app.services.tool_resolution_planner import evaluate_tool_resolution
+        tool_resolution = await evaluate_tool_resolution(db, content, rag_context)
+        intent_result["tool_resolution"] = tool_resolution
+        if tool_resolution.get("actionable"):
+            yield {"event": "tool_resolution", "data": json.dumps({
+                "actionable": True,
+                "workflow": tool_resolution.get("workflow"),
+                "matchedTools": tool_resolution.get("matched_tools") or [],
+                "reason": tool_resolution.get("reason"),
+            }, ensure_ascii=False)}
+            prev_intent = intent_result.get("intent")
+            if prev_intent in (NewIntentType.KNOWLEDGE_QA.value, NewIntentType.GENERAL_QA.value):
+                intent_result["intent"] = NewIntentType.FAULT_ANALYSIS.value
+                intent_result["method"] = (intent_result.get("method") or "") + "+tool_resolution"
+                intent_result["confidence"] = max(float(intent_result.get("confidence", 0.5)), 0.88)
+                intent = intent_result["intent"]
+                from app.services.intent_classifier import get_intent_metadata
+                intent_result["metadata"] = get_intent_metadata(NewIntentType.FAULT_ANALYSIS.value)
+                yield {"event": "intent", "data": json.dumps({
+                    "intent": intent_result["intent"],
+                    "confidence": intent_result["confidence"],
+                    "method": intent_result.get("method"),
+                    "label": intent_result.get("metadata", {}).get("label", intent),
+                    "upgradedFrom": prev_intent,
+                    "reason": tool_resolution.get("reason"),
+                }, ensure_ascii=False)}
+
         telemetry.end_step("ok", intent=intent_result["intent"],
                            confidence=intent_result.get("confidence", 0),
                            rag_hit=bool(rag_context))
@@ -2209,6 +2745,16 @@ async def _process_message_impl(
                 "blocked": True,
             })}
             await save_message(db, session_id, "assistant", f"⚠ {recheck['reason']}", trace_id=trace_id)
+            await _record_blocked_injection_audit(
+                db,
+                trace_id=trace_id,
+                session_id=session_id,
+                user_id=user_id,
+                reason=recheck.get("reason", ""),
+                severity=recheck.get("severity", "high"),
+                stage="context_recheck",
+                extra=recheck,
+            )
             try:
                 from app.services.workflow_audit import finalize_workflow_audit
                 await finalize_workflow_audit(
@@ -2246,6 +2792,16 @@ async def _process_message_impl(
             })}
             await save_message(db, session_id, "assistant",
                 "⚠ 检测到潜在的提示词注入行为，该请求已被安全系统拦截。", trace_id=trace_id)
+            await _record_blocked_injection_audit(
+                db,
+                trace_id=trace_id,
+                session_id=session_id,
+                user_id=user_id,
+                reason="意图分类检测到注入行为",
+                severity=intent_result.get("injection_severity", "medium"),
+                stage="intent_injection",
+                extra={"intent": intent_result.get("intent"), "is_injection": True},
+            )
             try:
                 from app.services.workflow_audit import finalize_workflow_audit
                 await finalize_workflow_audit(
@@ -2373,13 +2929,59 @@ async def _process_message_impl(
 
         use_plan_execute = workflow.get("use_diagnostic_plan", False)
         if use_plan_execute:
-            from app.services.human_supervision import enrich_diagnostic_plan_with_env
-            plan = await build_diagnostic_plan(content, intent, rag_context)
+            from app.services.human_supervision import enrich_diagnostic_plan_with_env, iter_diagnostic_plan_stream
+
+            yield response_phase(PHASE_PLAN, "正在生成诊断与执行方案…")
+            plan = None
+            async for evt in iter_diagnostic_plan_stream(
+                content, intent, rag_context,
+                tool_resolution=intent_result.get("tool_resolution"),
+            ):
+                evt_type = evt.get("type")
+                if evt_type == "start":
+                    yield {"event": "diagnostic_plan_start", "data": json.dumps({
+                        "traceId": trace_id,
+                        "title": evt.get("title"),
+                        "phenomenon": evt.get("phenomenon"),
+                        "intent": evt.get("intent"),
+                    }, ensure_ascii=False)}
+                elif evt_type == "delta":
+                    yield {"event": "diagnostic_plan_delta", "data": json.dumps(
+                        {k: v for k, v in evt.items() if k != "type"},
+                        ensure_ascii=False,
+                    )}
+                elif evt_type == "final":
+                    plan = evt.get("plan")
+
+            if not plan:
+                plan = await build_diagnostic_plan(
+                    content, intent, rag_context,
+                    tool_resolution=intent_result.get("tool_resolution"),
+                )
+
             plan = await enrich_diagnostic_plan_with_env(
                 plan, content, rag_context,
                 sensing_mode=workflow.get("env_sensing_mode") or "fault_diagnosis",
                 server_id=server_id,
             )
+            if plan.get("preliminary_analysis"):
+                yield {"event": "diagnostic_plan_delta", "data": json.dumps({
+                    "field": "preliminary_analysis",
+                    "value": plan["preliminary_analysis"],
+                }, ensure_ascii=False)}
+            if plan.get("environment_scan"):
+                yield {"event": "diagnostic_plan_delta", "data": json.dumps({
+                    "field": "environment_scan",
+                    "value": plan["environment_scan"],
+                }, ensure_ascii=False)}
+            whitelist = plan.get("file_protection_whitelist") or []
+            if whitelist:
+                yield {"event": "diagnostic_plan_delta", "data": json.dumps({
+                    "field": "file_protection",
+                    "value": whitelist[:8],
+                    "count": len(whitelist),
+                }, ensure_ascii=False)}
+
             sp = await save_supervision_plan(db, session_id, trace_id, user_id, intent, plan)
             yield _sse_exploring("plan_gen", "深度环境感知 + 方案生成", "Plan-Execute 方案已就绪", "done")
             plan_intro = (
@@ -2460,6 +3062,17 @@ async def _process_message_impl(
     history = await get_messages(db, session_id)
     memory_context = memory.build_memory_prompt()
     system_prompt = SYSTEM_PROMPT + build_intent_system_addon(intent_result, content)
+
+    from app.services.custom_tool_registry import load_custom_tool_registry
+    from app.services.tool_resolution_planner import build_tool_resolution_prompt
+    custom_registry = await load_custom_tool_registry(db)
+    set_active_custom_registry(custom_registry)
+    extra_tool_schemas = custom_registry.openai_schemas
+    tool_resolution = (intent_result or {}).get("tool_resolution") or {}
+    resolution_prompt = build_tool_resolution_prompt(tool_resolution)
+    if resolution_prompt:
+        system_prompt += resolution_prompt
+
     if plan_exec_prompt:
         system_prompt += (
             "\n\n## 方案已确认 — 必须调用工具执行\n"
@@ -2554,6 +3167,47 @@ async def _process_message_impl(
                 "pendingConfirm": any(
                     tc.get("status") == "pending_confirm" for tc in tool_call_records
                 ),
+                "pendingApproval": any(
+                    tc.get("status") == "pending_approval" for tc in tool_call_records
+                ),
+                "planInProgress": True,
+            })}
+            return
+
+        if _plan_has_pending_actions(tool_call_records):
+            async for ev in _yield_plan_step_progress(content, tool_call_records, planned_data):
+                yield ev
+            await save_message(db, session_id, "assistant", full_response, trace_id=trace_id)
+            if tool_call_records:
+                await upsert_tool_call_message(
+                    db, session_id, tool_call_records, trace_id=trace_id,
+                )
+            from app.services.audit_service import upsert_chat_audit_record
+            await upsert_chat_audit_record(
+                db,
+                trace_id=trace_id,
+                session_id=session_id,
+                user_id=user_id,
+                question=content,
+                answer=full_response,
+                tool_call_records=tool_call_records,
+                flow_status="awaiting_user_action",
+                telemetry=telemetry,
+                intent=intent,
+                intent_confidence=float(intent_result.get("confidence", 0)),
+            )
+            yield {"event": "message_done", "data": json.dumps({
+                "messageId": assistant_msg_id,
+                "traceId": trace_id,
+                "status": "awaiting_user_action",
+                "approvalId": next(
+                    (tc.get("approvalId") for tc in tool_call_records if tc.get("status") == "pending_approval"),
+                    None,
+                ),
+                "pendingConfirm": any(
+                    tc.get("status") == "pending_confirm" for tc in tool_call_records
+                ),
+                "pendingApproval": True,
                 "planInProgress": True,
             })}
             return
@@ -2600,7 +3254,7 @@ async def _process_message_impl(
         yield _sse_exploring("llm", "智能推理", f"第 {round_count}/{max_rounds} 轮")
 
         try:
-            async for chunk in call_deepseek(messages, stream=True):
+            async for chunk in call_deepseek(messages, stream=True, extra_tools=extra_tool_schemas):
                 choice = chunk.get("choices", [{}])[0]
                 delta = choice.get("delta", {})
 
@@ -3484,6 +4138,37 @@ async def _stream_plan_continuation(
         })}
         return
 
+    if _plan_has_pending_actions(tool_call_records) or _filter_actionable_pending_records(tool_call_records):
+        async for ev in _yield_plan_step_progress(user_question, tool_call_records, plan_data):
+            yield ev
+        await save_message(db, session_id, "assistant", full_response, trace_id=trace_id)
+        await upsert_tool_call_message(db, session_id, tool_call_records, trace_id=trace_id)
+        await upsert_chat_audit_record(
+            db,
+            trace_id=trace_id,
+            session_id=session_id,
+            user_id=user_id,
+            question=user_question,
+            answer=full_response,
+            tool_call_records=tool_call_records,
+            flow_status="awaiting_user_action",
+            intent=plan_intent,
+            intent_confidence=plan_intent_conf or None,
+        )
+        yield {"event": "message_done", "data": json.dumps({
+            "messageId": assistant_msg_id or generate_id(),
+            "traceId": trace_id,
+            "status": "awaiting_user_action",
+            "approvalId": next(
+                (tc.get("approvalId") for tc in tool_call_records if tc.get("status") == "pending_approval"),
+                None,
+            ),
+            "pendingConfirm": any(tc.get("status") == "pending_confirm" for tc in tool_call_records),
+            "pendingApproval": True,
+            "planInProgress": True,
+        })}
+        return
+
     async for ev in _yield_plan_final_summary_events(
         user_question, tool_call_records, full_response, plan_data,
     ):
@@ -3521,6 +4206,9 @@ async def stream_continue_plan_execution(
 ):
     """方案卡壳时：从已确认方案 + 当前工具记录续跑下一步。"""
     from app.models.supervision import SupervisionPlan
+    from app.services.custom_tool_registry import load_custom_tool_registry
+
+    set_active_custom_registry(await load_custom_tool_registry(db))
 
     await _repair_stale_tool_calls_in_session(db, session_id)
     row_result = await db.execute(
@@ -3546,8 +4234,22 @@ async def stream_continue_plan_execution(
         }
 
     if not _plan_has_remaining_steps(planned_ctx):
-        plan_data = planned_ctx.get("plan_data") or {}
         tool_call_records = list(planned_ctx.get("records") or [])
+        if _plan_has_pending_actions(tool_call_records) or _filter_actionable_pending_records(tool_call_records):
+            assistant_msg_id = generate_id()
+            yield {"event": "message_start", "data": json.dumps({
+                "messageId": assistant_msg_id, "traceId": trace_id,
+            })}
+            async for ev in _stream_plan_continuation(
+                db, session_id, trace_id, user_id, planned_ctx,
+                intro="",
+                assistant_msg_id=assistant_msg_id,
+                server_id=server_id,
+            ):
+                yield ev
+            return
+
+        plan_data = planned_ctx.get("plan_data") or {}
         user_question = (plan_data.get("phenomenon") or "").strip()
         plan_intent = planned_ctx.get("intent") or ""
         from app.services.audit_service import upsert_chat_audit_record

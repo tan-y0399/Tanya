@@ -204,9 +204,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
+import { useApprovalStore } from '@/stores/approval'
 import ApprovalModuleHub from '@/components/approval/ApprovalModuleHub.vue'
 import ApprovalFlowCard from '@/components/approval/ApprovalFlowCard.vue'
 import ApprovalDetailDrawer from '@/components/approval/ApprovalDetailDrawer.vue'
@@ -217,9 +218,7 @@ import {
   STAT_ACCENTS,
 } from '@/components/approval/approvalMeta'
 import {
-  getPendingApprovals,
   getApprovalHistory,
-  getApprovalStats,
   getApprovalById,
   approveApproval,
   rejectApproval,
@@ -231,17 +230,19 @@ import { formatTime } from '@/utils'
 import { ElMessage } from 'element-plus'
 
 const router = useRouter()
+const route = useRoute()
 const userStore = useUserStore()
+const approvalStore = useApprovalStore()
 const isAdmin = computed(() => userStore.userInfo?.role === 'admin')
 
-const tab = ref<'pending' | 'history'>('history')
-const pendingItems = ref<any[]>([])
-const pendingTotal = ref(0)
+const tab = ref<'pending' | 'history'>('pending')
+const pendingItems = computed(() => approvalStore.pendingItems)
+const pendingTotal = computed(() => approvalStore.pendingTotal)
+const stats = computed(() => approvalStore.stats)
 const historyItems = ref<any[]>([])
 const historyTotal = ref(0)
 const historyPage = ref(1)
 const historyPageSize = 20
-const stats = ref<Record<string, number>>({})
 const lastExecutionResult = ref<any>(null)
 const approving = ref<string | null>(null)
 const detailVisible = ref(false)
@@ -272,18 +273,12 @@ function formatUser(row: any) {
 }
 
 async function loadStats() {
-  try {
-    stats.value = await getApprovalStats()
-  } catch {
-    stats.value = {}
-  }
+  await approvalStore.refreshStats()
 }
 
 async function loadPending() {
   try {
-    const data = await getPendingApprovals()
-    pendingItems.value = data.items || []
-    pendingTotal.value = data.total || 0
+    await approvalStore.refreshPending()
   } catch {
     ElMessage.error('加载待审批列表失败')
   }
@@ -415,7 +410,30 @@ async function refreshAll() {
   await Promise.all([loadStats(), loadPending(), loadHistory()])
 }
 
-onMounted(refreshAll)
+watch(
+  () => approvalStore.pendingTotal,
+  (count, prev) => {
+    if (count > 0 && (prev === 0 || prev === undefined) && tab.value === 'history') {
+      tab.value = 'pending'
+    }
+  },
+)
+
+watch(
+  () => route.path,
+  (path) => {
+    if (path === '/approval') void refreshAll()
+  },
+)
+
+onMounted(() => {
+  approvalStore.startPolling(5000)
+  void refreshAll()
+})
+
+onUnmounted(() => {
+  approvalStore.stopPolling()
+})
 </script>
 
 <style lang="scss" scoped>

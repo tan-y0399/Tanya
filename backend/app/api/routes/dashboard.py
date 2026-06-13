@@ -294,19 +294,64 @@ def _fetch_vm_metrics_parallel(server_id: str = None):
     return metrics
 
 
+def _check_kylinops_backend_local() -> dict:
+    """KylinOps 后端跑在平台本机，不能依赖 SSH 到 Agent VM 查 systemctl。"""
+    import subprocess
+    import urllib.request
+
+    status = "unknown"
+    uptime = "N/A"
+    try:
+        proc = subprocess.run(
+            ["systemctl", "is-active", "kylinops"],
+            capture_output=True, text=True, timeout=3,
+        )
+        raw = (proc.stdout or proc.stderr or "").strip()
+        if raw == "active":
+            status = "running"
+        elif raw in ("inactive", "failed", "dead"):
+            status = "stopped"
+    except Exception as exc:
+        logger.debug("local kylinops systemctl check failed: %s", exc)
+
+    if status != "running":
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:8000/api/v1/system/health", timeout=2) as resp:
+                if resp.status == 200:
+                    status = "running"
+        except Exception:
+            pass
+
+    if status == "running":
+        try:
+            show = subprocess.run(
+                ["systemctl", "show", "kylinops", "-p", "ActiveEnterTimestamp"],
+                capture_output=True, text=True, timeout=3,
+            )
+            since_raw = (show.stdout or "").split("=", 1)[-1].strip()
+            if since_raw:
+                uptime = _service_uptime_to_chinese(since_raw)
+        except Exception:
+            uptime = "运行中"
+
+    return {"name": "KylinOps Backend", "port": 8000, "status": status, "uptime": uptime}
+
+
 def _check_services_parallel(server_id: str = None):
     """并行检查多个服务状态（批量查询，减少 SSH 调用次数）"""
     from app.services.remote_executor import run_command
 
-    services = [
+    remote_services = [
         {"name": "PostgreSQL", "port": 5432, "unit": "postgresql"},
         {"name": "Nginx", "port": 80, "unit": "nginx"},
-        {"name": "KylinOps Backend", "port": 8000, "unit": "kylinops"},
         {"name": "Redis", "port": 6379, "unit": "redis"},
     ]
 
-    # 批量查询所有服务状态（一次 SSH 调用）
-    status_cmd = "; ".join(f"echo '==={svc['unit']}==='; systemctl is-active {svc['unit']} 2>/dev/null || echo 'unknown'" for svc in services)
+    # 批量查询远程/平台基础设施服务状态（一次 SSH 调用）
+    status_cmd = "; ".join(
+        f"echo '==={svc['unit']}==='; systemctl is-active {svc['unit']} 2>/dev/null || echo 'unknown'"
+        for svc in remote_services
+    )
     status_result = _call_ssh_with_timeout(run_command, status_cmd, server_id=server_id)
 
     status_map = {}
@@ -315,7 +360,7 @@ def _check_services_parallel(server_id: str = None):
         status_map = _parse_kv(raw)
 
     # 批量查询运行中服务的 uptime（一次 SSH 调用）
-    running_units = [svc["unit"] for svc in services if status_map.get(svc["unit"], "").strip() == "active"]
+    running_units = [svc["unit"] for svc in remote_services if status_map.get(svc["unit"], "").strip() == "active"]
     uptime_map = {}
     if running_units:
         uptime_cmd = "; ".join(
@@ -328,7 +373,7 @@ def _check_services_parallel(server_id: str = None):
             uptime_map = _parse_kv(raw)
 
     results = []
-    for svc in services:
+    for svc in remote_services:
         raw_status = status_map.get(svc["unit"], "").strip()
         status = "running" if raw_status == "active" else ("stopped" if raw_status else "unknown")
         uptime = "N/A"
@@ -337,6 +382,7 @@ def _check_services_parallel(server_id: str = None):
             uptime = _service_uptime_to_chinese(since_raw) if since_raw else "N/A"
         results.append({"name": svc["name"], "port": svc["port"], "status": status, "uptime": uptime})
 
+    results.append(_check_kylinops_backend_local())
     return results
 
 

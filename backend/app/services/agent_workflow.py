@@ -109,9 +109,27 @@ def resolve_workflow_link(content: str, intent_result: dict) -> Dict[str, Any]:
     """
     intent = _intent(intent_result)
     conf = _confidence(intent_result)
+    tool_resolution = intent_result.get("tool_resolution") or {}
 
     high_conf_threshold = getattr(settings, "workflow_lightweight_confidence", 0.9)
     low_conf_threshold = getattr(settings, "workflow_plan_confidence", 0.7)
+
+    # 工具库命中可执行方案 → 优先 Plan-Execute 或轻量 ReAct
+    if tool_resolution.get("actionable"):
+        reason = tool_resolution.get("reason") or "工具库可执行方案"
+        if tool_resolution.get("prefer_plan"):
+            return _pack(
+                WorkflowLink.PLAN_EXECUTE,
+                reason,
+                use_plan=True,
+                sensing="fault_diagnosis",
+            )
+        return _pack(
+            WorkflowLink.LIGHTWEIGHT_REACT,
+            reason + "；单步/轻量工具，直接 ReAct",
+            use_plan=False,
+            sensing="quick_check",
+        )
 
     # 链路 A
     if intent in ("general_qa", "knowledge_qa"):

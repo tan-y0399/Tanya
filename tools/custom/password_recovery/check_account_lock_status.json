@@ -1,0 +1,20 @@
+{
+  "name": "check_account_lock_status",
+  "description": "生成 faillock / pam_tally2 检查命令，判断账户是否因多次输错密码被锁定。若仅锁定而非遗忘密码，优先解锁而非重置。",
+  "category": "system_operation",
+  "riskLevel": 1,
+  "enabled": true,
+  "trialArgs": {
+    "username": "kylin"
+  },
+  "config": {
+    "handler": "password_recovery",
+    "parameters": {
+      "username": {
+        "type": "string",
+        "required": true
+      }
+    }
+  },
+  "python": "\"\"\"KylinOps 工具：check_account_lock_status — 检查账户是否被 PAM 锁定\"\"\"\nNAME = \"check_account_lock_status\"\nDESCRIPTION = (\n    \"生成 faillock / pam_tally2 检查命令，判断账户是否因多次输错密码被锁定。\"\n    \"若仅锁定而非遗忘密码，优先解锁而非重置。\"\n)\nCATEGORY = \"system_operation\"\nRISK_LEVEL = 1\n\nTRIAL_ARGS = {\"username\": \"kylin\"}\n\n\ndef _cmds(username: str):\n    u = username.replace(\"'\", \"\")\n    return [\n        {\"command\": f\"faillock --user {u} 2>/dev/null || echo 'faillock-not-installed'\", \"purpose\": \"faillock 锁定记录（较新系统）\"},\n        {\"command\": f\"pam_tally2 --user {u} 2>/dev/null || echo 'pam_tally2-not-installed'\", \"purpose\": \"pam_tally2 失败次数（旧系统）\"},\n        {\"command\": f\"grep -E '^{u}:' /etc/shadow 2>/dev/null | cut -d: -f2 | head -c 20 || echo 'no-shadow-access'\", \"purpose\": \"shadow 状态抽样（!! 表示锁定，无直接改密）\"},\n    ]\n\n\ndef run(**kwargs):\n    username = (kwargs.get(\"username\") or kwargs.get(\"user\") or \"\").strip()\n    if not username:\n        return {\"success\": False, \"error\": \"请提供 username 参数\"}\n\n    return {\n        \"success\": True,\n        \"data\": {\n            \"tool\": NAME,\n            \"execution_mode\": \"remote_ssh\",\n            \"username\": username,\n            \"commands\": _cmds(username),\n            \"unlock_commands\": [\n                {\"command\": f\"faillock --user {username} --reset\", \"purpose\": \"解除 faillock 锁定\", \"risk\": \"L3\"},\n                {\"command\": f\"pam_tally2 --user {username} --reset\", \"purpose\": \"重置 pam_tally2 计数\", \"risk\": \"L3\"},\n            ],\n            \"decision_rules\": {\n                \"locked\": \"优先执行 unlock_commands 后让用户重试原密码\",\n                \"not_locked\": \"继续 get_password_policy → reset_user_password 流程\",\n            },\n            \"agent_instruction\": \"先执行检查命令；若锁定则解锁并告知用户，勿急于改密\",\n            \"trial_simulated\": {\"username\": username, \"locked\": False, \"fail_count\": 0},\n            \"summary\": f\"已生成用户「{username}」账户锁定状态检查方案\",\n        },\n    }\n"
+}

@@ -144,9 +144,17 @@ async def reject(db: AsyncSession, approval_id: str, approver: str, reason: str 
 
 async def get_stats(db: AsyncSession) -> dict:
     now = datetime.utcnow()
+    expire_result = await db.execute(
+        select(Approval).where(Approval.status == "pending", Approval.expires_at < now))
+    expired = expire_result.scalars().all()
+    if expired:
+        for a in expired:
+            a.status = "timeout"
+            a.resolved_at = now
+        await db.commit()
+
     total_q = select(func.count()).select_from(Approval)
-    pending_q = select(func.count()).select_from(Approval).where(Approval.status == "pending",
-                                                                   Approval.expires_at > now)
+    pending_q = select(func.count()).select_from(Approval).where(Approval.status == "pending")
     today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     today_q = select(func.count()).select_from(Approval).where(Approval.requested_at >= today)
 

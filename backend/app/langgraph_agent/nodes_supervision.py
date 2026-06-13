@@ -86,7 +86,10 @@ async def diagnostic_plan_node(state: AgentState) -> AgentState:
     rag = state.get("rag_context") or ""
     sensing = "fault_diagnosis" if intent == IntentType.FAULT_ANALYSIS.value else "full_check"
 
-    plan = await build_diagnostic_plan(text, intent, rag)
+    plan = await build_diagnostic_plan(
+        text, intent, rag,
+        tool_resolution=state.get("tool_resolution"),
+    )
     plan = await enrich_diagnostic_plan_with_env(
         plan, text, rag, sensing_mode=sensing, server_id=state.get("server_id"),
     )

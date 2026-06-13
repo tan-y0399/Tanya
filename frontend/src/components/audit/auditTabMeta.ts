@@ -53,7 +53,7 @@ export const TAB_HUB: Record<string, TabHubConfig> = {
   blocked_injection: {
     tag: 'MOD-BLOCK',
     title: '安全拦截审计',
-    desc: '提示词注入、诱导绕过与 L5 高危命令在入口被安全闸门阻断',
+    desc: '提示词注入、诱导绕过等在入口安全闸门被阻断的请求（不含已进入 Agent 的 L5 审批命令）',
     color: '#dc2626',
     cards: [
       { code: 'L5', label: '注入检测', desc: '正则 + LLM 双层检测', flow: ['预检', '复核', '阻断'] },

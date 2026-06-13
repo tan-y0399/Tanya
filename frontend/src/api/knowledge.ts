@@ -58,3 +58,46 @@ export async function resetKnowledge() {
   const { data } = await api.post('/knowledge/reset')
   return data
 }
+
+export interface ArticleFileValidation {
+  ok: boolean
+  stage: string
+  mode?: 'single' | 'batch'
+  articleCount?: number
+  title?: string
+  category?: string
+  tags?: string
+  content?: string
+  severity?: string
+  articles?: Array<{
+    title: string
+    category?: string
+    tags?: string
+    content?: string
+    severity?: string
+    source?: string
+  }>
+  diagnose?: { ok: boolean; messages: string[]; errors: string[]; warnings?: string[] }
+  parse?: { ok: boolean; error?: string; articleCount?: number }
+}
+
+export async function validateArticleFile(filename: string, content: string): Promise<ArticleFileValidation> {
+  const { data } = await api.post('/knowledge/validate-file', { filename, content })
+  return data.data
+}
+
+export async function importArticlesBatch(articles: ArticleFileValidation['articles']) {
+  const { data } = await api.post('/knowledge/import-batch', { articles })
+  return data
+}
+
+export async function createArticle(article: {
+  title: string
+  category?: string
+  tags?: string
+  content?: string
+  severity?: string
+}) {
+  const { data } = await api.post('/knowledge/articles', article)
+  return data
+}

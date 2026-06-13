@@ -1,9 +1,10 @@
 import os
 import logging
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 from sqlalchemy import select, func, text
 from app.models.knowledge import KnowledgeArticle
 
@@ -27,6 +28,24 @@ FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "..", "..", "frontend", 
 _INIT_FLAG_PATH = os.path.join(os.path.dirname(__file__), "..", ".initialized")
 
 app = FastAPI(title=settings.app_name, version=settings.version)
+
+
+class NoCacheIndexMiddleware(BaseHTTPMiddleware):
+    """避免浏览器长期缓存 index.html，导致前端 JS 包未更新。"""
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        path = request.url.path or ""
+        if path.startswith("/api/"):
+            return response
+        ct = (response.headers.get("content-type") or "").lower()
+        if path in ("", "/") or path.endswith("/index.html") or "text/html" in ct:
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+        return response
+
+
+app.add_middleware(NoCacheIndexMiddleware)
 
 
 def _is_first_startup() -> bool:

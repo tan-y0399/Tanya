@@ -42,6 +42,9 @@ export interface AuditRecordItem {
   traceIds?: string[]
   workflowLink?: string
   flowStatus?: string
+  blockReason?: string
+  blockStage?: string
+  blockSeverity?: string
   workflowStages?: Array<{
     stage: string
     status: string
@@ -161,19 +164,24 @@ export const STAT_CARDS = [
   { key: 'total', icon: 'stats-total' as AuditIconName, label: '总审计记录', tone: 'blue' as const, hint: '全库累计' },
   { key: 'today', icon: 'stats-today' as AuditIconName, label: '今日操作', tone: 'cyan' as const, hint: 'UTC 当日' },
   { key: 'l3', icon: 'stats-risk' as AuditIconName, label: 'L3+ 高风险', tone: 'orange' as const, hint: '需重点关注' },
-  { key: 'blocked', icon: 'stats-blocked' as AuditIconName, label: '安全拦截', tone: 'red' as const, hint: 'L5 / 注入' },
+  { key: 'blocked', icon: 'stats-blocked' as AuditIconName, label: '安全拦截', tone: 'red' as const, hint: '入口注入阻断' },
 ] as const
 
 export const HERO_MODULES = [
   { key: 'chat', icon: 'module-chat' as AuditIconName, label: 'Agent 对话', countFrom: 'byEventType.chat' as const },
-  { key: 'blocked', icon: 'module-blocked' as AuditIconName, label: '安全拦截', countFrom: 'blocked' as const },
+  { key: 'blocked', icon: 'module-blocked' as AuditIconName, label: '安全拦截', countFrom: 'byEventType.blocked_injection' as const },
   { key: 'resume', icon: 'module-resume' as AuditIconName, label: '审批恢复', countFrom: 'byEventType.chat_resume' as const },
   { key: 'workflow', icon: 'module-workflow' as AuditIconName, label: '安全流程', countFrom: 'byEventType.workflow' as const },
 ] as const
 
+export function securityBlockCount(stats: AuditStats | null | undefined): number {
+  if (!stats) return 0
+  return stats.byEventType?.blocked_injection ?? 0
+}
+
 export function resolveHeroCount(stats: AuditStats | null, countFrom: (typeof HERO_MODULES)[number]['countFrom']): number {
   if (!stats) return 0
-  if (countFrom === 'blocked') return stats.blocked
+  if (countFrom === 'byEventType.blocked_injection') return securityBlockCount(stats)
   if (countFrom === 'byEventType.chat') return stats.byEventType?.chat ?? 0
   if (countFrom === 'byEventType.chat_resume') return stats.byEventType?.chat_resume ?? 0
   if (countFrom === 'byEventType.workflow') return stats.byEventType?.workflow ?? 0

@@ -1,0 +1,8 @@
+{
+  "title": "磁盘空间未满但无法创建文件（inode 索引节点耗尽）",
+  "category": "磁盘与文件系统问题",
+  "tags": ["磁盘", "inode", "文件系统", "fontconfig", "maildrop", "故障排查"],
+  "severity": "warning",
+  "source": "web_research",
+  "content": "## 问题描述\n\n`df -h` 显示根分区仍有空间，但创建文件报错 `No space left on device`；执行 `df -i /` 发现 IUse% 为 100%，属于 inode（索引节点）耗尽。\n\n## 排查步骤\n\n1. `df -h / && df -i /` 区分空间满还是 inode 满\n2. `du --inodes --max-depth=1 / | sort -nr | head -20` 定位高占用目录\n3. `lsof | grep deleted` 检查僵尸文件\n4. 检查 `/var/spool/postfix/maildrop` 是否 cron 邮件积压\n\n## 常见根因（银河麒麟）\n\n- `/usr/lib/fontconfig/cache` 下海量 `.cache-*` 小文件\n- 定时任务未重定向输出导致 maildrop 堆积\n- 应用碎片化小日志\n\n## 处理示例\n\n```bash\n# 备份后清理 fontconfig 过期缓存\ntar czf /data/backup/fontconfig-cache.tar.gz /usr/lib/fontconfig/cache\nfind /usr/lib/fontconfig/cache -type f -mtime +100 -name '*.cache-*' -delete\ndf -i /\n```\n\n## 预防\n\n- 监控 `df -i` 使用率\n- cron 添加 `>/dev/null 2>&1`\n- 配置 journald SystemMaxUse 限制\n\n**参考**：CSDN 银河麒麟 inode 案例、华为云 inode 耗尽排查"
+}

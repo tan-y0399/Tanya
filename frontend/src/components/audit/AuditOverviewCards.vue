@@ -22,7 +22,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import AuditIcon from './AuditIcon.vue'
-import { STAT_CARDS, type AuditStats } from './auditEventMeta'
+import { STAT_CARDS, type AuditStats, securityBlockCount } from './auditEventMeta'
 
 const props = defineProps<{
   stats: AuditStats | null
@@ -35,7 +35,7 @@ const cards = computed(() => {
     total: s?.total ?? '—',
     today: s?.today ?? '—',
     l3: s?.l3Plus ?? '—',
-    blocked: s?.blocked ?? '—',
+    blocked: s != null ? securityBlockCount(s) : '—',
   }
   return STAT_CARDS.map((c) => ({
     ...c,

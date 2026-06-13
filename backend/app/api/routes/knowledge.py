@@ -15,6 +15,7 @@ from app.services.knowledge_engagement import (
     toggle_like,
     toggle_favorite,
 )
+from app.services.article_file_validator import validate_article_file
 
 router = APIRouter(prefix="/knowledge", tags=["知识库"])
 
@@ -575,6 +576,89 @@ async def reset_knowledge(
     return {"code": 0, "message": "知识库已重置，共导入 {} 篇文章".format(len(articles)), "data": {
         "total": len(articles), "categories": cats, "sources": source_counts,
     }}
+
+
+@router.post("/validate-file")
+async def validate_article_file_api(
+    payload: dict = Body(...),
+    user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """诊断并解析上传的知识库文件（拖拽导入前校验）"""
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可操作")
+    filename = (payload.get("filename") or "").strip()
+    content = payload.get("content") or ""
+    if not filename:
+        raise HTTPException(status_code=400, detail="缺少文件名")
+
+    result = validate_article_file(filename, content)
+    if result.get("ok") and result.get("mode") == "single":
+        title = (result.get("title") or "").strip()
+        if title:
+            existing = (
+                await db.execute(select(KnowledgeArticle).where(KnowledgeArticle.title == title))
+            ).scalar_one_or_none()
+            if existing:
+                result["ok"] = False
+                result["stage"] = "diagnose"
+                diagnose = result.setdefault("diagnose", {"ok": False, "messages": [], "errors": [], "warnings": []})
+                diagnose["ok"] = False
+                errors = diagnose.setdefault("errors", [])
+                if f"文章标题「{title}」已存在" not in errors:
+                    errors.insert(0, f"文章标题「{title}」已存在")
+
+    return {"code": 0, "data": result}
+
+
+@router.post("/import-batch")
+async def import_articles_batch(
+    payload: dict = Body(...),
+    user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """批量导入知识库文章（跳过已存在标题）"""
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可操作")
+    items = payload.get("articles") or []
+    if not isinstance(items, list) or not items:
+        raise HTTPException(status_code=400, detail="articles 不能为空")
+
+    created = 0
+    skipped = 0
+    for item in items:
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+        title = (item.get("title") or "").strip()
+        if not title:
+            skipped += 1
+            continue
+        existing = (
+            await db.execute(select(KnowledgeArticle).where(KnowledgeArticle.title == title))
+        ).scalar_one_or_none()
+        if existing:
+            skipped += 1
+            continue
+        tags = item.get("tags") or ""
+        if isinstance(tags, list):
+            tags = ",".join(str(t).strip() for t in tags if str(t).strip())
+        db.add(KnowledgeArticle(
+            title=title,
+            category=(item.get("category") or "")[:120],
+            tags=str(tags)[:500],
+            content=item.get("content") or "",
+            source=item.get("source") or "file_import",
+            severity=(item.get("severity") or "info")[:20],
+        ))
+        created += 1
+
+    await db.commit()
+    return {
+        "code": 0,
+        "message": f"批量导入完成：新增 {created} 篇，跳过 {skipped} 篇",
+        "data": {"created": created, "skipped": skipped},
+    }
 
 
 @router.post("/articles")

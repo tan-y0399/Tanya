@@ -19,6 +19,9 @@
     </header>
 
     <p class="card-summary">{{ record.summary }}</p>
+    <p v-if="record.eventType === 'blocked_injection' && blockReasonText" class="card-block-reason">
+      {{ blockReasonText }}
+    </p>
 
     <div v-if="showPipeline" class="card-pipeline">
       <div class="pipeline-track" aria-hidden="true">
@@ -164,6 +167,14 @@ const displayUser = computed(() => {
   return name || props.record.userId
 })
 
+const blockReasonText = computed(() => {
+  if (props.record.eventType !== 'blocked_injection') return ''
+  const reason = props.record.blockReason || props.record.summary || ''
+  const stage = props.record.blockStage
+  if (!reason) return ''
+  return stage ? `[${stage}] ${reason}` : reason
+})
+
 function nodeStatusTone(s: AuditFlowNode['status']): string {
   if (s === 'passed') return 'ok'
   if (s === 'blocked') return 'danger'
@@ -296,6 +307,17 @@ function nodeStatusLabel(s: AuditFlowNode['status']): string {
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+
+.card-block-reason {
+  margin: -6px 0 14px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  font-size: 13px;
+  color: #b91c1c;
+  line-height: 1.45;
 }
 
 .card-pipeline {

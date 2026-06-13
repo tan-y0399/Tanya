@@ -45,9 +45,12 @@
       </section>
 
       <!-- 诊断思路 -->
-      <section v-if="plan.analysis_summary" v-show="visible.analysis" class="block analysis-block stream-in">
+      <section v-if="plan.analysis_summary || generating" v-show="visible.analysis" class="block analysis-block stream-in">
         <h4 class="block-title"><span class="block-icon">💡</span>诊断思路</h4>
-        <p class="block-text">{{ plan.analysis_summary }}</p>
+        <p class="block-text">
+          {{ plan.analysis_summary || '正在分析…' }}
+          <span v-if="generating && !planComplete" class="typing-cursor" aria-hidden="true" />
+        </p>
       </section>
 
       <!-- 可能根因 -->
@@ -164,9 +167,9 @@
       <span class="foot-hint">确认后将按步骤依次执行，写操作需您二次确认</span>
       <div class="foot-actions">
         <button type="button" class="btn-cancel" @click="$emit('cancel')">终止</button>
-        <button type="button" class="btn-run" @click="$emit('confirm')">
-          确认并执行
-          <span v-if="plan.steps?.length" class="btn-step-count">{{ plan.steps.length }} 步</span>
+        <button type="button" class="btn-run" :disabled="!confirmable || generating" @click="$emit('confirm')">
+          {{ generating ? '方案生成中…' : '确认并执行' }}
+          <span v-if="plan.steps?.length && !generating" class="btn-step-count">{{ plan.steps.length }} 步</span>
         </button>
       </div>
     </footer>
@@ -185,10 +188,12 @@ const props = withDefaults(
     plan: Record<string, any>
     mode?: 'confirm' | 'readonly'
     streamReveal?: boolean
+    generating?: boolean
+    confirmable?: boolean
     traceId?: string
     userQuestion?: string
   }>(),
-  { mode: 'confirm', streamReveal: true },
+  { mode: 'confirm', streamReveal: true, generating: false, confirmable: true },
 )
 
 defineEmits<{ confirm: []; cancel: [] }>()
@@ -196,9 +201,12 @@ defineEmits<{ confirm: []; cancel: [] }>()
 const advancedOpen = ref(false)
 const visibleStepIndex = ref(-1)
 
-const enableStream = toRef(() => props.streamReveal && props.mode === 'confirm')
+const enableStream = toRef(() => props.streamReveal && props.mode === 'confirm' && !props.generating)
+const isGenerating = toRef(() => !!props.generating)
 const hasActions = toRef(() => props.mode === 'confirm')
-const { visible } = usePlanStreamReveal(enableStream, hasActions)
+const { visible, revealAll } = usePlanStreamReveal(enableStream, hasActions)
+
+const planComplete = computed(() => !!props.confirmable && !props.generating)
 
 const intentLabel = computed(() => {
   const m: Record<string, string> = {
@@ -315,7 +323,33 @@ watch(() => visible.value.steps, (v) => {
   else if (v) visibleStepIndex.value = (props.plan.steps?.length || 1) - 1
 })
 
+watch(
+  () => [props.generating, props.plan.analysis_summary, props.plan.possible_causes, props.plan.steps, props.plan.rag_sources],
+  () => {
+    if (!isGenerating.value) return
+    visible.value.head = true
+    visible.value.meta = true
+    visible.value.phenomenon = true
+    if (props.plan.analysis_summary) visible.value.analysis = true
+    if (props.plan.possible_causes?.length) visible.value.causes = true
+    if (props.plan.rag_sources?.length || props.plan.rag_reference) visible.value.rag = true
+    if (props.plan.steps?.length) {
+      visible.value.steps = true
+      visibleStepIndex.value = props.plan.steps.length - 1
+    }
+    if (props.plan.risk_note) visible.value.note = true
+    if (props.confirmable) visible.value.actions = true
+  },
+  { deep: true },
+)
+
 onMounted(() => {
+  if (isGenerating.value) {
+    visible.value.head = true
+    visible.value.meta = true
+    visible.value.phenomenon = true
+    return
+  }
   if (!enableStream.value) {
     visibleStepIndex.value = (props.plan.steps?.length || 1) - 1
   }
@@ -663,6 +697,20 @@ onMounted(() => {
   color: #1e293b;
 }
 
+.typing-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: #6366f1;
+  animation: blink 0.9s step-end infinite;
+}
+
+@keyframes blink {
+  50% { opacity: 0; }
+}
+
 .goal-text {
   margin: 0;
   font-size: 15px;
@@ -919,9 +967,14 @@ onMounted(() => {
   background: linear-gradient(135deg, #2563eb, #4f46e5);
   color: #fff;
   box-shadow: 0 3px 10px rgba(37, 99, 235, 0.35);
-  &:hover {
+  &:hover:not(:disabled) {
     transform: translateY(-1px);
     box-shadow: 0 5px 14px rgba(37, 99, 235, 0.4);
+  }
+  &:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+    box-shadow: none;
   }
 }
 

@@ -1,0 +1,29 @@
+{
+  "name": "check_ssh_connectivity",
+  "description": "生成在目标麒麟 VM 上检测 SSH 连通性的命令集与判定规则。用于决定走「在线 reset_user_password」还是「离线 get_password_recovery_playbook」流程。",
+  "category": "system_monitor",
+  "riskLevel": 1,
+  "enabled": true,
+  "trialArgs": {
+    "host": "192.168.1.100",
+    "port": 22,
+    "ssh_user": "root"
+  },
+  "config": {
+    "handler": "password_recovery",
+    "parameters": {
+      "host": {
+        "type": "string"
+      },
+      "port": {
+        "type": "integer",
+        "default": 22
+      },
+      "ssh_user": {
+        "type": "string",
+        "default": "root"
+      }
+    }
+  },
+  "python": "\"\"\"KylinOps 工具：check_ssh_connectivity — 检测目标 VM SSH 连通性与登录账号\"\"\"\nNAME = \"check_ssh_connectivity\"\nDESCRIPTION = (\n    \"生成在目标麒麟 VM 上检测 SSH 连通性的命令集与判定规则。\"\n    \"用于决定走「在线 reset_user_password」还是「离线 get_password_recovery_playbook」流程。\"\n)\nCATEGORY = \"system_monitor\"\nRISK_LEVEL = 1\n\nTRIAL_ARGS = {\"host\": \"192.168.1.100\", \"port\": 22, \"ssh_user\": \"root\"}\n\nREMOTE_COMMANDS = [\n    {\"command\": \"whoami\", \"purpose\": \"确认当前 SSH 登录账号\"},\n    {\"command\": \"hostname\", \"purpose\": \"确认目标主机名\"},\n    {\"command\": \"echo kylinops-ssh-ok\", \"purpose\": \"连通性探针\"},\n    {\"command\": \"getent passwd root | cut -d: -f1,3,6,7\", \"purpose\": \"确认 root 账户存在\"},\n]\n\n\ndef run(**kwargs):\n    host = (kwargs.get(\"host\") or kwargs.get(\"target_host\") or \"\").strip()\n    port = int(kwargs.get(\"port\") or 22)\n    ssh_user = (kwargs.get(\"ssh_user\") or kwargs.get(\"username\") or \"root\").strip()\n\n    route_online = {\n        \"condition\": \"SSH 可达且为 root 或具备 sudo passwd 权限的运维账号\",\n        \"next_tools\": [\n            \"get_user_account_info\",\n            \"check_account_lock_status\",\n            \"get_password_policy\",\n            \"reset_user_password\",\n            \"verify_account_after_reset\",\n        ],\n    }\n    route_offline = {\n        \"condition\": \"SSH 不可达或仅有目标用户自身凭证且已遗忘\",\n        \"next_tools\": [\"check_console_access_available\", \"get_password_recovery_playbook\"],\n    }\n\n    return {\n        \"success\": True,\n        \"data\": {\n            \"tool\": NAME,\n            \"execution_mode\": \"remote_ssh\",\n            \"target\": {\"host\": host, \"port\": port, \"ssh_user\": ssh_user},\n            \"commands\": REMOTE_COMMANDS,\n            \"agent_instruction\": (\n                \"先确认 KylinOps 已绑定目标服务器且 SSH 连接成功；\"\n                \"再对目标 VM 通过 execute_command 执行 commands 列表；\"\n                \"若全部成功则走 online 流程，否则走 offline 流程。\"\n            ),\n            \"decision_rules\": {\n                \"ssh_ok\": route_online,\n                \"ssh_fail\": route_offline,\n            },\n            \"trial_simulated\": {\n                \"ssh_reachable\": True,\n                \"logged_in_as\": ssh_user,\n                \"recommended_route\": \"online\",\n            },\n            \"summary\": f\"已生成 SSH 连通性检查方案（目标 {host or '已选服务器'}:{port}，账号 {ssh_user}）\",\n        },\n    }\n"
+}

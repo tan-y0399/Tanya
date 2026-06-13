@@ -191,6 +191,8 @@
                 :plan="planUiForGroup(group)!.plan"
                 :mode="planUiForGroup(group)!.mode"
                 :stream-reveal="planUiForGroup(group)!.stream"
+                :generating="planUiForGroup(group)!.generating"
+                :confirmable="planUiForGroup(group)!.confirmable"
                 :trace-id="planUiForGroup(group)!.traceId"
                 :user-question="planUiForGroup(group)!.userQuestion"
                 @confirm="handlePlanConfirm"
@@ -396,6 +398,7 @@ import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useChatStore } from '@/stores/chat'
 import { useUserStore } from '@/stores/user'
+import { useApprovalStore } from '@/stores/approval'
 import type { ToolCall, Message } from '@/stores/chat'
 import type { RollbackToolStatus } from '@/api/chat'
 import {
@@ -440,6 +443,7 @@ import { toolDisplayName } from '@/utils/toolDisplay'
 const route = useRoute()
 const chatStore = useChatStore()
 const userStore = useUserStore()
+const approvalStore = useApprovalStore()
 const msgContainer = ref<HTMLElement>()
 const highlightTraceId = ref<string | null>(null)
 let highlightTraceTimer: ReturnType<typeof setTimeout> | null = null
@@ -528,6 +532,7 @@ const diagnosticPlan = ref<{
   plan: Record<string, any>
   resolved: boolean
   traceId?: string
+  generating?: boolean
 } | null>(null)
 const planRiskMessage = ref<string | null>(null)
 /** 方案确认后挂在原 Agent 消息组下展示（警告框 + 只读方案） */
@@ -647,15 +652,14 @@ function computePlanProgressFromTools(): PlanProgressPayload | null {
   if (!arch?.plan?.steps?.length) return null
   const steps = arch.plan.steps as { order: number; action: string }[]
   const merged = getAllToolCallsMerged()
-  const terminal = new Set(['completed', 'failed', 'blocked', 'rejected'])
   const doneOrders = new Set<number>()
-  for (const tc of merged) {
-    const order = (tc as PendingConfirmTool).planStepOrder
-    if (order != null && terminal.has(tc.status)) doneOrders.add(order)
+  for (const step of steps) {
+    if (isStepOrderDone(merged, step.order)) doneOrders.add(step.order)
   }
   const pending = merged.filter(t => {
     if (t.status !== 'pending_confirm' && t.status !== 'pending_approval') return false
     const order = (t as PendingConfirmTool).planStepOrder
+    if (t.status === 'pending_approval') return true
     return order == null || !doneOrders.has(order)
   })
   const current = pending[0] as PendingConfirmTool | undefined
@@ -671,11 +675,7 @@ function computePlanProgressFromTools(): PlanProgressPayload | null {
   } else if (doneOrders.size >= total) {
     const failedOrders = steps.filter(s => {
       const matches = merged.filter(t => (t as PendingConfirmTool).planStepOrder === s.order)
-      if (!matches.length) return false
-      const best = matches.reduce((a, b) =>
-        toolStatusPriority(b.status) >= toolStatusPriority(a.status) ? b : a,
-      )
-      return best.status === 'failed'
+      return resolvePlanStepStatus(matches) === 'failed'
     })
     briefParts.push(
       failedOrders.length
@@ -693,18 +693,7 @@ function computePlanProgressFromTools(): PlanProgressPayload | null {
     brief: briefParts.join('，'),
     steps: steps.map(s => {
       const matches = merged.filter(t => (t as PendingConfirmTool).planStepOrder === s.order)
-      if (!matches.length) {
-        return { order: s.order, action: s.action, status: doneOrders.has(s.order) ? 'completed' : 'pending' }
-      }
-      const best = matches.reduce((a, b) =>
-        toolStatusPriority(b.status) >= toolStatusPriority(a.status) ? b : a,
-      )
-      let status = best.status || 'pending'
-      if (doneOrders.has(s.order) && (status === 'pending_confirm' || status === 'pending_approval')) {
-        const terminalRec = matches.find(t => terminal.has(t.status))
-        status = terminalRec?.status || 'completed'
-      }
-      return { order: s.order, action: s.action, status }
+      return { order: s.order, action: s.action, status: resolvePlanStepStatus(matches) }
     }),
   }
 }
@@ -727,6 +716,7 @@ function countTerminalPlanSteps(merged: PendingConfirmTool[], total: number): nu
 }
 
 const planAllCompleted = computed(() => {
+  if (hasEffectivePendingAction()) return false
   const p = planProgressState.value
   if (!p?.totalSteps) return false
   if ((p.completedSteps ?? 0) >= p.totalSteps) return true
@@ -845,17 +835,12 @@ function ensurePlanArchiveFromTools() {
 
 function hasEffectivePendingAction(): boolean {
   const merged = getAllToolCallsMerged()
-  const terminal = new Set(['completed', 'failed', 'blocked', 'rejected'])
-  const doneSteps = new Set<number>()
-  for (const tc of merged) {
-    const order = (tc as PendingConfirmTool).planStepOrder
-    if (order != null && terminal.has(tc.status)) doneSteps.add(order)
-  }
   for (const tc of merged) {
     if (tc.status === 'executing') return true
-    if (tc.status !== 'pending_confirm' && tc.status !== 'pending_approval') continue
+    if (tc.status === 'pending_approval') return true
+    if (tc.status !== 'pending_confirm') continue
     const order = (tc as PendingConfirmTool).planStepOrder
-    if (order != null && doneSteps.has(order)) continue
+    if (order != null && isStepOrderDone(merged, order)) continue
     return true
   }
   return false
@@ -865,9 +850,10 @@ function isPlanStuck(): boolean {
   if (!shouldAllowPlanContinue()) return false
   if (continuePlanBusy.value || chatStore.isStreaming) return false
   if (hasInlinePlanConfirm.value || findPendingConfirmTool()) return false
+  if (hasEffectivePendingAction()) return false
   ensurePlanArchiveFromTools()
   if (!isPlanIncomplete()) return false
-  return !hasEffectivePendingAction()
+  return true
 }
 
 function tryContinueStuckPlan() {
@@ -945,7 +931,8 @@ function tryContinueStuckPlan() {
       })
       planProgress.value = computePlanProgressFromTools()
       waitingApprovalId.value = approval.approvalId
-      startApprovalPolling(approval.approvalId)
+      void approvalStore.refreshPending()
+      startApprovalPolling()
       startAwaitingRunPolling(sid)
       chatStore.setStreaming(false)
     },
@@ -1010,6 +997,25 @@ function toolStatusPriority(status: string) {
   if (status === 'executing') return 2
   if (status === 'pending_confirm' || status === 'pending_approval') return 1
   return 0
+}
+
+function resolvePlanStepStatus(matches: ToolCall[]): string {
+  if (!matches.length) return 'pending'
+  if (matches.some(t => t.status === 'pending_approval')) return 'pending_approval'
+  if (matches.some(t => t.status === 'pending_confirm')) return 'pending_confirm'
+  if (matches.some(t => t.status === 'executing')) return 'executing'
+  const terminal = new Set(['completed', 'failed', 'blocked', 'rejected', 'skipped'])
+  const best = matches.reduce((a, b) =>
+    toolStatusPriority(b.status) >= toolStatusPriority(a.status) ? b : a,
+  )
+  return terminal.has(best.status) ? best.status : 'pending'
+}
+
+function isStepOrderDone(merged: ToolCall[], order: number): boolean {
+  const matches = merged.filter(t => (t as PendingConfirmTool).planStepOrder === order)
+  if (!matches.length) return false
+  const status = resolvePlanStepStatus(matches)
+  return ['completed', 'failed', 'blocked', 'rejected', 'skipped'].includes(status)
 }
 
 function toolMergeKey(tc: ToolCall, linkedPeIds: Set<string>): string {
@@ -1537,6 +1543,92 @@ function restorePlanArchive(sessionId: string) {
   } catch { /* ignore */ }
 }
 
+async function applyDiagnosticPlanStart(payload: any) {
+  stopPlanFallbackPoll()
+  if (!planRiskMessage.value) {
+    planRiskMessage.value = '您的请求涉及高风险操作，相关指令将需要审批后方可执行。'
+  }
+  diagnosticPlan.value = {
+    planId: '',
+    plan: {
+      title: payload.title || '运维诊断与执行方案',
+      intent: payload.intent,
+      phenomenon: payload.phenomenon || '',
+      possible_causes: [],
+      steps: [],
+      analysis_summary: '',
+    },
+    resolved: false,
+    generating: true,
+    traceId: payload.traceId,
+  }
+  chatStore.setStreaming(true)
+  chatStore.setResponsePhase('plan', '正在生成诊断与执行方案…')
+  chatStore.upsertExploringStep({
+    id: 'plan_gen',
+    title: '生成诊断方案',
+    detail: '正在构建执行步骤…',
+    status: 'running',
+  })
+  scrollToBottom()
+}
+
+function applyDiagnosticPlanDelta(delta: any) {
+  if (!diagnosticPlan.value) {
+    void applyDiagnosticPlanStart({
+      traceId: delta.traceId,
+      title: '运维诊断与执行方案',
+      intent: chatStore.currentIntent || '',
+      phenomenon: '',
+    })
+  }
+  const current = diagnosticPlan.value!
+  const plan = { ...current.plan }
+  switch (delta.field) {
+    case 'analysis_token':
+      plan.analysis_summary = (plan.analysis_summary || '') + (delta.token || '')
+      break
+    case 'analysis_summary':
+      plan.analysis_summary = delta.value || ''
+      break
+    case 'rag_sources':
+      plan.rag_sources = delta.value
+      break
+    case 'possible_cause': {
+      const causes = [...(plan.possible_causes || [])]
+      causes[delta.index] = delta.value
+      plan.possible_causes = causes.filter(Boolean)
+      break
+    }
+    case 'possible_causes':
+      plan.possible_causes = delta.value
+      break
+    case 'step': {
+      const steps = [...(plan.steps || [])]
+      steps[delta.index] = delta.value
+      plan.steps = steps.filter(Boolean)
+      break
+    }
+    case 'risk_note':
+      plan.risk_note = delta.value
+      break
+    case 'preliminary_analysis':
+      plan.preliminary_analysis = delta.value
+      break
+    case 'environment_scan':
+      plan.environment_scan = delta.value
+      break
+    case 'file_protection':
+      plan.file_protection_whitelist = delta.value
+      plan.file_protection_count = delta.count
+      break
+    default:
+      break
+  }
+  diagnosticPlan.value = { ...current, plan }
+  scrollToBottom()
+}
+
 async function applyDiagnosticPlanPayload(payload: any) {
   if (!payload?.planId) return
   stopPlanFallbackPoll()
@@ -1545,8 +1637,13 @@ async function applyDiagnosticPlanPayload(payload: any) {
   }
   diagnosticPlan.value = {
     planId: payload.planId,
-    plan: { ...(payload.plan || {}), traceId: payload.traceId },
+    plan: {
+      ...(diagnosticPlan.value?.plan || {}),
+      ...(payload.plan || {}),
+      traceId: payload.traceId,
+    },
     resolved: false,
+    generating: false,
     traceId: payload.traceId,
   }
   finishExploringSteps()
@@ -1714,6 +1811,32 @@ async function recoverRejectedApprovalSummary(sessionId: string) {
   } catch { /* ignore */ }
 }
 
+function collectPendingApprovalIds(): string[] {
+  const ids = new Set<string>()
+  for (const m of chatStore.messages) {
+    for (const tc of m.toolCalls || []) {
+      if (tc.status === 'pending_approval' && (tc as any).approvalId) {
+        ids.add((tc as any).approvalId)
+      }
+    }
+  }
+  if (waitingApprovalId.value) ids.add(waitingApprovalId.value)
+  return [...ids]
+}
+
+function markToolsByApproval(approvalId: string, status: 'rejected' | 'approved', reason?: string) {
+  for (const m of chatStore.messages) {
+    if (!m.toolCalls?.length) continue
+    for (const tc of m.toolCalls) {
+      if ((tc as any).approvalId !== approvalId) continue
+      if (status === 'rejected') {
+        tc.status = 'rejected'
+        tc.result = { success: false, error: reason || '管理员已拒绝：不予执行' }
+      }
+    }
+  }
+}
+
 async function handleApprovalResolved(approvalId: string) {
   const sid = chatStore.currentSessionId
   try {
@@ -1741,6 +1864,12 @@ async function handleApprovalResolved(approvalId: string) {
     if (detail?.status === 'rejected' || detail?.status === 'timeout') {
       pendingAction.value = null
       waitingApprovalId.value = null
+      const reason = detail?.status === 'timeout'
+        ? '审批超时，操作未执行'
+        : (detail?.comment ? `管理员已拒绝：${detail.comment}` : '管理员已拒绝：不予执行')
+      markToolsByApproval(approvalId, 'rejected', reason)
+      planProgress.value = computePlanProgressFromTools()
+      scrollToBottom()
       if (!sid) return
       chatStore.setStreaming(true)
       try {
@@ -1790,22 +1919,33 @@ async function handleApprovalResolved(approvalId: string) {
   }
 }
 
-function startApprovalPolling(approvalId: string) {
+function startApprovalPolling(approvalId?: string) {
   stopApprovalPolling()
   const pollOnce = async () => {
-    try {
-      const detail = await getApprovalById(approvalId)
-      if (!detail || detail.status === 'pending') return
+    const ids = approvalId ? [approvalId] : collectPendingApprovalIds()
+    if (!ids.length) {
       stopApprovalPolling()
-      const pa = pendingAction.value
-      if (pa?.type === 'approval' && pa.approvalId === approvalId && !pa.resolved) {
-        pa.resolved = true
-      }
-      await handleApprovalResolved(approvalId)
-    } catch { /* ignore transient errors */ }
+      return
+    }
+    let anyResolved = false
+    for (const id of ids) {
+      try {
+        const detail = await getApprovalById(id)
+        if (!detail || detail.status === 'pending') continue
+        anyResolved = true
+        const pa = pendingAction.value
+        if (pa?.type === 'approval' && pa.approvalId === id && !pa.resolved) {
+          pa.resolved = true
+        }
+        await handleApprovalResolved(id)
+      } catch { /* ignore transient errors */ }
+    }
+    if (anyResolved && !collectPendingApprovalIds().length) {
+      stopApprovalPolling()
+    }
   }
   pollOnce()
-  pollTimer.value = setInterval(pollOnce, 3000)
+  pollTimer.value = setInterval(pollOnce, 2000)
 }
 
 function stopAwaitingRunPolling() {
@@ -1915,6 +2055,8 @@ interface PlanUiState {
   plan: Record<string, any>
   mode: 'confirm' | 'readonly'
   stream: boolean
+  generating?: boolean
+  confirmable?: boolean
   traceId?: string
   userQuestion?: string
 }
@@ -1925,7 +2067,9 @@ function planUiForGroup(group: (typeof groupedMessages.value)[number]): PlanUiSt
       riskMessage: planRiskMessage.value,
       plan: diagnosticPlan.value.plan,
       mode: 'confirm',
-      stream: true,
+      stream: !diagnosticPlan.value.generating,
+      generating: !!diagnosticPlan.value.generating,
+      confirmable: !!diagnosticPlan.value.planId,
       traceId: diagnosticPlan.value.traceId || group.msg.traceId,
       userQuestion: userQuestionForGroup(group),
     }
@@ -2335,6 +2479,7 @@ async function handleSend(
           commandPreview: approval.commandPreview,
         })
         planProgress.value = computePlanProgressFromTools()
+        void approvalStore.refreshPending()
         pendingAction.value = {
           type: 'approval', approvalId: approval.approvalId,
           toolName: approval.toolName, params: approval.params || {},
@@ -2348,7 +2493,7 @@ async function handleSend(
           })
         }
         chatStore.setStreaming(false)
-        startApprovalPolling(approval.approvalId)
+        startApprovalPolling()
         const sid = chatStore.currentSessionId
         if (sid) startAwaitingRunPolling(sid)
       },
@@ -2555,7 +2700,7 @@ async function handleSend(
           })
           const sid = chatStore.currentSessionId
           const apvId = waitingApprovalId.value || pendingAction.value?.approvalId
-          if (apvId && !pollTimer.value) startApprovalPolling(apvId)
+          if (apvId && !pollTimer.value) startApprovalPolling()
           if (sid) startAwaitingRunPolling(sid)
           scrollToBottom()
           return
@@ -2568,6 +2713,12 @@ async function handleSend(
         stopApprovalPolling()
         stopAwaitingRunPolling()
         pendingAction.value = null
+      },
+      onDiagnosticPlanStart: (payload: any) => {
+        void applyDiagnosticPlanStart(payload)
+      },
+      onDiagnosticPlanDelta: (delta: any) => {
+        applyDiagnosticPlanDelta(delta)
       },
       onDiagnosticPlan: (payload: any) => {
         void applyDiagnosticPlanPayload(payload)
@@ -2599,7 +2750,7 @@ async function handleSend(
             || waitingApprovalId.value
             || pendingAction.value?.approvalId
           if (apvId && !pollTimer.value) {
-            startApprovalPolling(apvId)
+            startApprovalPolling()
           }
         }
         if (result.status === 'awaiting_user_action' || result.status === 'awaiting_confirm') {
@@ -3163,7 +3314,7 @@ async function restorePendingActions(sessionId: string) {
         expiresAt: match.expiresAt,
         resolved: false,
       }
-      startApprovalPolling(match.id)
+      startApprovalPolling()
       startAwaitingRunPolling(sessionId)
     }
   } catch {}

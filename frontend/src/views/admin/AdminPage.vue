@@ -159,7 +159,7 @@
           <div class="toolbar-left">
             <el-input v-model="articleSearch" placeholder="搜索标题或内容…" clearable class="search-input" />
             <div class="filter-chips">
-              <button type="button" class="chip" :class="{ active: articleSeverityFilter === '' }" @click="articleSeverityFilter = ''">全部 {{ articles.length }}</button>
+              <button type="button" class="chip" :class="{ active: articleSeverityFilter === '' }" @click="articleSeverityFilter = ''">全部 {{ articleTotal }}</button>
               <button type="button" class="chip critical" :class="{ active: articleSeverityFilter === 'critical' }" @click="articleSeverityFilter = 'critical'">严重</button>
               <button type="button" class="chip warn" :class="{ active: articleSeverityFilter === 'warning' }" @click="articleSeverityFilter = 'warning'">警告</button>
               <button type="button" class="chip" :class="{ active: articleSeverityFilter === 'info' }" @click="articleSeverityFilter = 'info'">一般</button>
@@ -169,10 +169,13 @@
             <button type="button" class="ghost-btn" :disabled="reindexing" @click="handleReindex">
               {{ reindexing ? '重建中…' : '重建索引' }}
             </button>
-            <button type="button" class="primary-btn" @click="showArticleDialog = true">+ 添加文章</button>
+            <button type="button" class="primary-btn" @click="openAddArticleDialog">+ 添加文章</button>
           </div>
         </div>
         <div class="data-card">
+          <p v-if="articles.length < articleTotal" class="article-load-hint">
+            列表已加载 {{ articles.length }} / {{ articleTotal }} 篇（管理列表上限 1000，数量统计与知识库页同步）
+          </p>
           <el-table :data="filteredArticles" stripe empty-text="暂无匹配文章">
             <el-table-column prop="title" label="标题" min-width="200" show-overflow-tooltip />
             <el-table-column prop="category" label="分类" width="100" />
@@ -267,10 +270,17 @@
       :confirm-text="isEditTool ? '保存' : '添加'"
       :loading="toolSaving"
       loading-text="保存中…"
+      :confirm-disabled="toolConfirmDisabled"
       width="min(620px, 96vw)"
       @confirm="handleSaveTool"
     >
-      <AdminTechField label="工具名称" code="FLD-01" hint="唯一标识符，如 get_disk_usage，创建后不可修改" required tag="API ID">
+      <AdminToolFileDropzone
+        v-if="!isEditTool"
+        :reset-key="toolFileResetKey"
+        @validated="onToolFileValidated"
+        @cleared="onToolFileCleared"
+      />
+      <AdminTechField label="工具名称" code="FLD-01" hint="唯一标识符，如 get_disk_usage；拖拽文件时将自动填入文件名" required tag="API ID">
         <el-input v-model="currentTool.name" :disabled="isEditTool" placeholder="如 get_disk_usage" />
       </AdminTechField>
       <AdminTechField label="功能描述" code="FLD-02" hint="Agent 理解该工具用途的自然语言说明" required>
@@ -339,23 +349,36 @@
       code="KB-NEW"
       module-key="knowledge"
       accent-color="#d97706"
-      confirm-text="创建"
+      :confirm-text="articleBatchMode ? `批量导入 (${articleBatchCount})` : '创建'"
+      :loading="articleCreating"
+      loading-text="保存中…"
+      :confirm-disabled="articleConfirmDisabled"
       width="min(620px, 96vw)"
       @confirm="handleCreateArticle"
     >
-      <AdminTechField label="标题" code="FLD-01" hint="文章主题，供用户浏览与 RAG 检索" required>
+      <AdminTechField label="文件导入" code="FILE-01" hint="拖拽 .md / .json / .txt，自动解析并填充下方表单；多篇 Markdown 可批量导入" tag="IMPORT">
+        <AdminArticleFileDropzone
+          :reset-key="articleFileResetKey"
+          @validated="onArticleFileValidated"
+          @cleared="onArticleFileCleared"
+        />
+      </AdminTechField>
+      <div v-if="articleBatchMode" class="batch-hint">
+        已从文件解析 <strong>{{ articleBatchCount }}</strong> 篇文章，点击下方按钮将跳过已存在标题并批量导入。
+      </div>
+      <AdminTechField v-if="!articleBatchMode" label="标题" code="FLD-01" hint="文章主题，供用户浏览与 RAG 检索；拖拽文件时将自动填入" required>
         <el-input v-model="newArticle.title" placeholder="文章标题" />
       </AdminTechField>
-      <AdminTechField label="分类" code="FLD-02" hint="知识领域分类，如故障排查、性能优化" tag="CATEGORY">
+      <AdminTechField v-if="!articleBatchMode" label="分类" code="FLD-02" hint="知识领域分类，如故障排查、性能优化" tag="CATEGORY">
         <el-input v-model="newArticle.category" placeholder="如：故障排查" />
       </AdminTechField>
-      <AdminTechField label="标签" code="FLD-03" hint="逗号分隔，提升检索命中率" tag="TAGS">
+      <AdminTechField v-if="!articleBatchMode" label="标签" code="FLD-03" hint="逗号分隔，提升检索命中率" tag="TAGS">
         <el-input v-model="newArticle.tags" placeholder="逗号分隔，如：磁盘,性能" />
       </AdminTechField>
-      <AdminTechField label="级别" code="FLD-04" hint="标识文章重要程度，影响展示优先级" tag="SEVERITY">
+      <AdminTechField v-if="!articleBatchMode" label="级别" code="FLD-04" hint="标识文章重要程度，影响展示优先级" tag="SEVERITY">
         <AdminSeverityPicker v-model="newArticle.severity" />
       </AdminTechField>
-      <AdminTechField label="内容" code="FLD-05" hint="正文内容，Agent RAG 将引用此文本" required tag="BODY">
+      <AdminTechField v-if="!articleBatchMode" label="内容" code="FLD-05" hint="正文内容，Agent RAG 将引用此文本" required tag="BODY">
         <el-input v-model="newArticle.content" type="textarea" :rows="6" placeholder="文章正文…" />
       </AdminTechField>
     </AdminTechDialog>
@@ -387,6 +410,22 @@
         <el-input v-model="editArticle.content" type="textarea" :rows="6" />
       </AdminTechField>
     </AdminTechDialog>
+
+    <!-- 删除确认 -->
+    <AdminConfirmDialog
+      v-model="deleteDialog.visible"
+      :title="deleteDialog.title"
+      :subtitle="deleteDialog.subtitle"
+      :message="deleteDialog.message"
+      :item-title="deleteDialog.itemTitle"
+      :item-meta="deleteDialog.itemMeta"
+      :item-tag="deleteDialog.itemTag"
+      :module-key="deleteDialog.moduleKey"
+      :code="deleteDialog.code"
+      :loading="deleteDialog.loading"
+      @confirm="confirmDelete"
+      @cancel="deleteDialog.visible = false"
+    />
   </div>
 </template>
 
@@ -396,6 +435,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { MoreFilled } from '@element-plus/icons-vue'
 import { getUsers, createUser, updateUser, deleteUser, resetPassword } from '@/api/users'
 import { getTools, addTool, updateTool, deleteTool, toggleTool } from '@/api/tools'
+import type { ToolFileValidation } from '@/api/tools'
 import { getConfig, updateConfig } from '@/api/system'
 import api from '@/api/index'
 import type { UserInfo } from '@/api/users'
@@ -405,10 +445,15 @@ import AdminPageHeader from '@/components/admin/AdminPageHeader.vue'
 import AdminGearHub from '@/components/admin/AdminGearHub.vue'
 import AdminModulePanel from '@/components/admin/AdminModulePanel.vue'
 import AdminTechDialog from '@/components/admin/AdminTechDialog.vue'
+import AdminConfirmDialog from '@/components/admin/AdminConfirmDialog.vue'
 import AdminTechField from '@/components/admin/AdminTechField.vue'
 import AdminSeverityPicker from '@/components/admin/AdminSeverityPicker.vue'
+import type { ArticleSeverity } from '@/components/admin/AdminSeverityPicker.vue'
 import AdminTechCardPicker from '@/components/admin/AdminTechCardPicker.vue'
+import AdminToolFileDropzone from '@/components/admin/AdminToolFileDropzone.vue'
+import AdminArticleFileDropzone from '@/components/admin/AdminArticleFileDropzone.vue'
 import AdminSecurityConfigStage from '@/components/admin/AdminSecurityConfigStage.vue'
+import { importArticlesBatch, createArticle, type ArticleFileValidation } from '@/api/knowledge'
 import type { TechCardOption } from '@/components/admin/AdminTechCardPicker.vue'
 import type { AdminGearKey } from '@/components/admin/gearPaths'
 
@@ -516,7 +561,7 @@ const gearModules = computed(() => [
     code: 'MOD-KB',
     label: '知识库',
     desc: '运维文章维护与 RAG 索引',
-    stat: `${articles.value.length} 篇文章`,
+    stat: `${articleTotal.value} 篇文章`,
     color: '#d97706',
     glow: '#d97706',
   },
@@ -550,9 +595,18 @@ const showToolDialog = ref(false)
 const showPresetDialog = ref(false)
 const isEditTool = ref(false)
 const toolSaving = ref(false)
+const toolFileFromUpload = ref(false)
+const toolFilePassed = ref(false)
+const toolFileResetKey = ref(0)
 const importing = ref(false)
 const currentTool = reactive({ id: '', name: '', description: '', category: '', riskLevel: 1, enabled: true, configStr: '' })
 const presetTools = ref<any[]>([])
+
+const toolConfirmDisabled = computed(() => {
+  if (isEditTool.value) return false
+  if (!toolFileFromUpload.value) return false
+  return !toolFilePassed.value
+})
 
 const enabledToolCount = computed(() => tools.value.filter(t => t.enabled).length)
 const highRiskToolCount = computed(() => tools.value.filter(t => t.riskLevel >= 3).length)
@@ -593,13 +647,107 @@ const savingConfig = ref(false)
 
 // ========== 知识库 ==========
 const articles = ref<any[]>([])
+const articleTotal = ref(0)
 const articleSearch = ref('')
 const articleSeverityFilter = ref('')
 const showArticleDialog = ref(false)
 const showEditArticleDialog = ref(false)
 const reindexing = ref(false)
-const newArticle = reactive({ title: '', category: '', tags: '', content: '', severity: 'info' })
-const editArticle = reactive({ id: '', title: '', category: '', tags: '', content: '', severity: 'info' })
+const articleCreating = ref(false)
+const articleFileFromUpload = ref(false)
+const articleFilePassed = ref(false)
+const articleFileResetKey = ref(0)
+const articleBatchMode = ref(false)
+const articleBatchCount = ref(0)
+const articleBatchItems = ref<ArticleFileValidation['articles']>([])
+
+const articleConfirmDisabled = computed(() => {
+  if (!articleFileFromUpload.value) return false
+  return !articleFilePassed.value
+})
+
+type DeleteKind = 'user' | 'tool' | 'article'
+const deleteDialog = reactive({
+  visible: false,
+  loading: false,
+  kind: 'user' as DeleteKind,
+  target: null as any,
+  title: '确认删除',
+  subtitle: 'DESTRUCTIVE ACTION · 不可逆操作',
+  message: '',
+  itemTitle: '',
+  itemMeta: '',
+  itemTag: '',
+  moduleKey: 'users' as AdminGearKey,
+  code: 'ACT-DEL',
+})
+
+function openDeleteDialog(kind: DeleteKind, row: any) {
+  deleteDialog.kind = kind
+  deleteDialog.target = row
+  deleteDialog.loading = false
+
+  if (kind === 'user') {
+    deleteDialog.title = '确认删除用户'
+    deleteDialog.message = '确定要删除以下用户账号吗？该账号将无法再登录系统。'
+    deleteDialog.itemTitle = row.username
+    deleteDialog.itemMeta = `角色：${roleMap[row.role] || row.role}`
+    deleteDialog.itemTag = 'USER'
+    deleteDialog.moduleKey = 'users'
+    deleteDialog.code = 'USR-DEL'
+  } else if (kind === 'tool') {
+    deleteDialog.title = '确认删除工具'
+    deleteDialog.message = '确定要删除以下 Agent 工具吗？删除后 Agent 将无法再调用该工具。'
+    deleteDialog.itemTitle = row.name
+    deleteDialog.itemMeta = row.description || CATEGORY_LABELS[row.category] || row.category
+    deleteDialog.itemTag = `L${row.riskLevel ?? 1}`
+    deleteDialog.moduleKey = 'tools'
+    deleteDialog.code = 'TL-DEL'
+  } else {
+    deleteDialog.title = '确认删除文章'
+    deleteDialog.message = '确定要删除以下知识库文章吗？删除后需重新导入或手动创建。'
+    deleteDialog.itemTitle = row.title
+    deleteDialog.itemMeta = [row.category, severityLabel(row.severity)].filter(Boolean).join(' · ')
+    deleteDialog.itemTag = severityLabel(row.severity)
+    deleteDialog.moduleKey = 'knowledge'
+    deleteDialog.code = 'KB-DEL'
+  }
+
+  deleteDialog.visible = true
+}
+
+async function confirmDelete() {
+  if (!deleteDialog.target || deleteDialog.loading) return
+  deleteDialog.loading = true
+  try {
+    if (deleteDialog.kind === 'user') {
+      await deleteUser(deleteDialog.target.id)
+      ElMessage.success('用户已删除')
+      loadUsers()
+    } else if (deleteDialog.kind === 'tool') {
+      await deleteTool(deleteDialog.target.id)
+      ElMessage.success('工具已删除')
+      loadTools()
+    } else {
+      await api.delete(`/knowledge/articles/${deleteDialog.target.id}`)
+      ElMessage.success('文章已删除')
+      loadArticles()
+    }
+    deleteDialog.visible = false
+    deleteDialog.target = null
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || e?.message || '删除失败')
+  } finally {
+    deleteDialog.loading = false
+  }
+}
+
+const newArticle = reactive<{ title: string; category: string; tags: string; content: string; severity: ArticleSeverity }>({
+  title: '', category: '', tags: '', content: '', severity: 'info',
+})
+const editArticle = reactive<{ id: string; title: string; category: string; tags: string; content: string; severity: ArticleSeverity }>({
+  id: '', title: '', category: '', tags: '', content: '', severity: 'info',
+})
 
 const filteredArticles = computed(() => {
   let list = articles.value
@@ -634,8 +782,10 @@ async function loadConfig() {
 }
 async function loadArticles() {
   try {
-    const { data } = await api.get('/knowledge/articles?size=200')
-    articles.value = data.data?.items || []
+    const { data } = await api.get('/knowledge/articles', { params: { page: 1, size: 1000 } })
+    const payload = data.data || {}
+    articles.value = payload.items || []
+    articleTotal.value = payload.total ?? articles.value.length
   } catch { ElMessage.error('加载知识库失败') }
 }
 
@@ -679,10 +829,7 @@ async function handleResetPwd(row: UserInfo) {
 
 async function handleDeleteUser(row: UserInfo) {
   if (row.username === 'admin') return
-  try {
-    await ElMessageBox.confirm(`确定删除用户「${row.username}」？此操作不可恢复。`, '确认删除', { type: 'warning' })
-    await deleteUser(row.id); ElMessage.success('已删除'); loadUsers()
-  } catch {}
+  openDeleteDialog('user', row)
 }
 
 function handleToolAction(cmd: string, row: ToolInfo) {
@@ -693,8 +840,28 @@ function handleToolAction(cmd: string, row: ToolInfo) {
 
 function openAddToolDialog() {
   isEditTool.value = false
+  toolFileFromUpload.value = false
+  toolFilePassed.value = false
+  toolFileResetKey.value++
   Object.assign(currentTool, { id: '', name: '', description: '', category: '', riskLevel: 1, enabled: true, configStr: '' })
   showToolDialog.value = true
+}
+
+function onToolFileValidated(result: ToolFileValidation) {
+  toolFileFromUpload.value = true
+  toolFilePassed.value = !!result.ok
+  if (result.ok) {
+    currentTool.name = result.name
+    currentTool.description = result.description || ''
+    currentTool.category = result.category || 'system_operation'
+    currentTool.riskLevel = result.riskLevel ?? 1
+    currentTool.configStr = JSON.stringify(result.config || {}, null, 2)
+  }
+}
+
+function onToolFileCleared() {
+  toolFileFromUpload.value = false
+  toolFilePassed.value = false
 }
 
 function openEditTool(row: ToolInfo) {
@@ -708,6 +875,10 @@ function openEditTool(row: ToolInfo) {
 
 async function handleSaveTool() {
   if (!currentTool.name) { ElMessage.warning('请填写工具名称'); return }
+  if (!isEditTool.value && toolFileFromUpload.value && !toolFilePassed.value) {
+    ElMessage.warning('工具文件尚未通过诊断与试运行')
+    return
+  }
   toolSaving.value = true
   try {
     let cfg = {}
@@ -725,10 +896,7 @@ async function onToggleTool(v: any, row: ToolInfo) {
 }
 
 async function handleDeleteTool(row: ToolInfo) {
-  try {
-    await ElMessageBox.confirm(`确定删除工具「${row.name}」？`, '确认', { type: 'warning' })
-    await deleteTool(row.id); ElMessage.success('已删除'); loadTools()
-  } catch {}
+  openDeleteDialog('tool', row)
 }
 
 function loadPresetTools() {
@@ -766,19 +934,84 @@ function handleArticleAction(cmd: string, row: any) {
   else if (cmd === 'delete') handleDeleteArticle(row)
 }
 
+function openAddArticleDialog() {
+  articleFileFromUpload.value = false
+  articleFilePassed.value = false
+  articleBatchMode.value = false
+  articleBatchCount.value = 0
+  articleBatchItems.value = []
+  articleFileResetKey.value++
+  Object.assign(newArticle, { title: '', category: '', tags: '', content: '', severity: 'info' })
+  showArticleDialog.value = true
+}
+
+function onArticleFileValidated(result: ArticleFileValidation) {
+  articleFileFromUpload.value = true
+  articleFilePassed.value = !!result.ok
+  if (!result.ok) return
+
+  if (result.mode === 'batch' && (result.articles?.length || 0) > 1) {
+    articleBatchMode.value = true
+    articleBatchCount.value = result.articleCount || result.articles?.length || 0
+    articleBatchItems.value = result.articles || []
+    return
+  }
+
+  articleBatchMode.value = false
+  articleBatchCount.value = 1
+  articleBatchItems.value = []
+  newArticle.title = result.title || ''
+  newArticle.category = result.category || ''
+  newArticle.tags = typeof result.tags === 'string' ? result.tags : ''
+  newArticle.content = result.content || ''
+  newArticle.severity = (['info', 'warning', 'critical'].includes(result.severity || '')
+    ? result.severity
+    : 'info') as ArticleSeverity
+}
+
+function onArticleFileCleared() {
+  articleFileFromUpload.value = false
+  articleFilePassed.value = false
+  articleBatchMode.value = false
+  articleBatchCount.value = 0
+  articleBatchItems.value = []
+}
+
 async function handleCreateArticle() {
-  if (!newArticle.title.trim()) { ElMessage.warning('请填写标题'); return }
+  if (articleFileFromUpload.value && !articleFilePassed.value) {
+    ElMessage.warning('知识库文件尚未通过格式诊断与内容解析')
+    return
+  }
+
+  articleCreating.value = true
   try {
-    await api.post('/knowledge/articles', { ...newArticle, tags: newArticle.tags })
-    ElMessage.success('文章已创建'); showArticleDialog.value = false
-    newArticle.title = ''; newArticle.content = ''; loadArticles()
-  } catch { ElMessage.error('创建失败') }
+    if (articleBatchMode.value && articleBatchItems.value?.length) {
+      const res = await importArticlesBatch(articleBatchItems.value)
+      ElMessage.success(res.message || `已导入 ${res.data?.created ?? 0} 篇文章`)
+      showArticleDialog.value = false
+      loadArticles()
+      return
+    }
+
+    if (!newArticle.title.trim()) { ElMessage.warning('请填写标题'); return }
+    await createArticle({ ...newArticle, tags: newArticle.tags })
+    ElMessage.success('文章已创建')
+    showArticleDialog.value = false
+    newArticle.title = ''
+    newArticle.content = ''
+    loadArticles()
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || e?.message || '创建失败')
+  } finally {
+    articleCreating.value = false
+  }
 }
 
 function openEditArticle(row: any) {
   editArticle.id = row.id; editArticle.title = row.title; editArticle.category = row.category
   editArticle.tags = Array.isArray(row.tags) ? row.tags.join(',') : (row.tags || '')
-  editArticle.content = row.content; editArticle.severity = row.severity
+  editArticle.content = row.content
+  editArticle.severity = (row.severity || 'info') as ArticleSeverity
   showEditArticleDialog.value = true
 }
 
@@ -790,10 +1023,7 @@ async function handleUpdateArticle() {
 }
 
 async function handleDeleteArticle(row: any) {
-  try {
-    await ElMessageBox.confirm(`确定删除「${row.title}」？`, '确认', { type: 'warning' })
-    await api.delete(`/knowledge/articles/${row.id}`); ElMessage.success('已删除'); loadArticles()
-  } catch {}
+  openDeleteDialog('article', row)
 }
 
 async function handleReindex() {
@@ -999,6 +1229,29 @@ onMounted(() => { loadUsers(); loadTools(); loadConfig(); loadArticles() })
   &:hover { border-color: #2563eb; color: #2563eb; background: #eff6ff; }
 }
 .danger-text { color: #ef4444; }
+
+.batch-hint {
+  margin-bottom: 14px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(217, 119, 6, 0.25);
+  background: linear-gradient(135deg, rgba(255, 251, 235, 0.95), rgba(254, 243, 199, 0.35));
+  font-size: 13px;
+  color: #92400e;
+  line-height: 1.5;
+
+  strong { color: #b45309; }
+}
+
+.article-load-hint {
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: rgba(254, 243, 199, 0.35);
+  border: 1px solid rgba(217, 119, 6, 0.2);
+  font-size: 12px;
+  color: #92400e;
+}
 
 .preset-toolbar {
   display: flex;

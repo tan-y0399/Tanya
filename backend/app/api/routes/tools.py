@@ -6,6 +6,7 @@ from sqlalchemy import select
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.tool_config import ToolConfig
+from app.services.tool_file_validator import validate_tool_file
 
 router = APIRouter(prefix="/tools", tags=["工具管理"])
 
@@ -41,6 +42,35 @@ async def list_tools(
     result = await db.execute(select(ToolConfig).order_by(ToolConfig.category, ToolConfig.name))
     tools = result.scalars().all()
     return {"code": 0, "data": {"items": [_serialize_tool(t) for t in tools]}}
+
+
+@router.post("/validate-file")
+async def validate_tool_file_api(
+    payload: dict = Body(...),
+    user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """诊断并试运行上传的工具文件（拖拽导入前校验）"""
+    _require_admin(user)
+    filename = (payload.get("filename") or "").strip()
+    content = payload.get("content") or ""
+    if not filename:
+        raise HTTPException(status_code=400, detail="缺少文件名")
+
+    result = validate_tool_file(filename, content)
+    name = (result.get("name") or "").strip()
+    if name:
+        existing = (await db.execute(select(ToolConfig).where(ToolConfig.name == name))).scalar_one_or_none()
+        if existing:
+            result["ok"] = False
+            result["stage"] = "diagnose"
+            diagnose = result.setdefault("diagnose", {"ok": False, "messages": [], "errors": []})
+            diagnose["ok"] = False
+            errors = diagnose.setdefault("errors", [])
+            if f"工具名称「{name}」已存在" not in errors:
+                errors.insert(0, f"工具名称「{name}」已存在")
+
+    return {"code": 0, "data": result}
 
 
 @router.post("/add")

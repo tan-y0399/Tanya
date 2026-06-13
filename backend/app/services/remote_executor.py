@@ -85,6 +85,8 @@ def _command_needs_root(command: str) -> bool:
     cmd = command.strip()
     if _is_root_maintenance_command(command):
         return True
+    if re.search(r"\bchpasswd\b", cmd, re.I) or re.search(r"\bpasswd\s+--stdin\b", cmd, re.I):
+        return True
     if cmd.startswith("systemctl ") and not cmd.startswith("systemctl status"):
         return True
     if re.search(r"\b(dnf|yum|apt-get|apt)\s+install\b", cmd, re.I):

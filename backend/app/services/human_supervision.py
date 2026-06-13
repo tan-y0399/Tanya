@@ -412,6 +412,175 @@ async def _resolve_fault_rag(content: str, rag_context: str = "") -> tuple[str, 
     return ctx, sources
 
 
+ANALYSIS_STREAM_SYSTEM_PROMPT = """你是麒麟操作系统运维故障诊断专家。
+根据用户故障现象与知识库参考，用 1～2 句中文说明诊断思路（为何怀疑这些根因、优先检查什么）。
+只输出连贯文字，不要 JSON、不要编号列表、不要 markdown 标题。"""
+
+
+async def _stream_fault_analysis_tokens(
+    content: str,
+    ctx: str,
+    sources: List[dict],
+):
+    """流式输出诊断思路文本 token。"""
+    from app.services.chat_service import call_deepseek
+
+    source_lines = []
+    for i, s in enumerate(sources[:5], 1):
+        source_lines.append(
+            f"[{i}] {s.get('title', '')} (相关度 {s.get('score', 0)}): {s.get('snippet', '')[:180]}"
+        )
+    kb_block = "\n".join(source_lines) if source_lines else (ctx[:1200] if ctx else "（知识库未命中）")
+    user_prompt = f"""【用户故障现象】
+{content[:500]}
+
+【知识库参考】
+{kb_block}
+
+请输出诊断思路："""
+    messages = [
+        {"role": "system", "content": ANALYSIS_STREAM_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+    try:
+        async for chunk in call_deepseek(messages, stream=True, use_tools=False):
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            token = delta.get("content") or ""
+            if token:
+                yield token
+    except Exception:
+        return
+
+
+async def iter_diagnostic_plan_stream(
+    content: str,
+    intent: str,
+    rag_context: str = "",
+    tool_resolution: dict | None = None,
+):
+    """
+    流式生成诊断方案：yield start / delta / final 事件 payload。
+    供 chat_service 转为 diagnostic_plan_start / diagnostic_plan_delta SSE。
+    """
+    import asyncio
+
+    tool_resolution = tool_resolution or {}
+    title = "运维诊断与执行方案"
+    if tool_resolution.get("workflow") == "password_recovery":
+        title = "密码找回诊断与执行方案"
+    elif tool_resolution.get("workflow") == "custom_tools":
+        title = "工具库可执行方案"
+
+    yield {
+        "type": "start",
+        "title": title,
+        "phenomenon": content[:300],
+        "intent": intent,
+    }
+
+    use_llm_stream = (
+        intent in ("fault_analysis", "high_risk")
+        and _is_fault_like_content(content)
+        and not tool_resolution.get("actionable")
+    )
+
+    if use_llm_stream:
+        ctx, sources = await _resolve_fault_rag(content, rag_context)
+        if sources:
+            yield {
+                "type": "delta",
+                "field": "rag_sources",
+                "value": [
+                    {
+                        "title": s.get("title", ""),
+                        "score": s.get("score", 0),
+                        "confidence": s.get("confidence_label", ""),
+                    }
+                    for s in sources[:5]
+                ],
+            }
+
+        analysis_parts: List[str] = []
+        async for token in _stream_fault_analysis_tokens(content, ctx, sources):
+            analysis_parts.append(token)
+            yield {"type": "delta", "field": "analysis_token", "token": token}
+
+        streamed_analysis = "".join(analysis_parts).strip()
+        llm_plan = await _build_rag_llm_fault_plan(content, intent, rag_context)
+        if llm_plan:
+            analysis = streamed_analysis or llm_plan.get("analysis_summary") or ""
+            if analysis and not streamed_analysis:
+                chunk_size = 6
+                for i in range(0, len(analysis), chunk_size):
+                    yield {
+                        "type": "delta",
+                        "field": "analysis_token",
+                        "token": analysis[i:i + chunk_size],
+                    }
+                    await asyncio.sleep(0.015)
+
+            causes = llm_plan.get("possible_causes") or []
+            steps = llm_plan.get("steps") or []
+            for i, cause in enumerate(causes):
+                yield {"type": "delta", "field": "possible_cause", "value": cause, "index": i}
+                await asyncio.sleep(0.03)
+
+            for i, step in enumerate(steps):
+                yield {"type": "delta", "field": "step", "value": step, "index": i}
+                await asyncio.sleep(0.04)
+
+            plan = {
+                "title": title,
+                "intent": intent,
+                "phenomenon": content[:300],
+                "possible_causes": causes,
+                "steps": steps,
+                "analysis_summary": analysis,
+                "rag_reference": (llm_plan.get("rag_context_used") or "")[:300] or None,
+                "rag_sources": llm_plan.get("rag_sources") or [],
+                "risk_note": "L4/L5 操作将触发管理员审批 + 用户确认执行；L2/L3 需您在对话页确认。",
+                "requires_confirm": True,
+                "plan_origin": "rag_llm",
+            }
+            yield {"type": "delta", "field": "risk_note", "value": plan["risk_note"]}
+            yield {"type": "final", "plan": plan}
+            return
+
+    plan = await build_diagnostic_plan(
+        content, intent, rag_context, tool_resolution=tool_resolution,
+    )
+
+    if plan.get("rag_sources"):
+        yield {"type": "delta", "field": "rag_sources", "value": plan["rag_sources"]}
+
+    analysis = (plan.get("analysis_summary") or "").strip()
+    if analysis:
+        chunk_size = 6
+        for i in range(0, len(analysis), chunk_size):
+            yield {
+                "type": "delta",
+                "field": "analysis_token",
+                "token": analysis[i:i + chunk_size],
+            }
+            await asyncio.sleep(0.015)
+
+    for i, cause in enumerate(plan.get("possible_causes") or []):
+        yield {"type": "delta", "field": "possible_cause", "value": cause, "index": i}
+        await asyncio.sleep(0.03)
+
+    for i, step in enumerate(plan.get("steps") or []):
+        yield {"type": "delta", "field": "step", "value": step, "index": i}
+        await asyncio.sleep(0.04)
+
+    if plan.get("risk_note"):
+        yield {"type": "delta", "field": "risk_note", "value": plan["risk_note"]}
+
+    yield {"type": "final", "plan": plan}
+
+
 def _parse_llm_json_object(text: str) -> Optional[dict]:
     if not text:
         return None
@@ -631,7 +800,12 @@ async def _build_rag_llm_fault_plan(content: str, intent: str, rag_context: str)
     }
 
 
-async def build_diagnostic_plan(content: str, intent: str, rag_context: str = "") -> dict:
+async def build_diagnostic_plan(
+    content: str,
+    intent: str,
+    rag_context: str = "",
+    tool_resolution: dict | None = None,
+) -> dict:
     """阶段3链路B：生成结构化诊断方案（RAG + LLM 根因分析，失败时规则兜底）。"""
     from app.services.ops_scope import (
         is_disk_cleanup_execution_request,
@@ -639,6 +813,65 @@ async def build_diagnostic_plan(content: str, intent: str, rag_context: str = ""
         is_time_sync_request,
         parse_service_control_target,
     )
+    from app.services.tool_resolution_planner import build_password_recovery_plan_steps
+
+    tool_resolution = tool_resolution or {}
+
+    # 管理员注册的自定义工具可执行方案（如密码找回）
+    if tool_resolution.get("actionable"):
+        workflow = tool_resolution.get("workflow")
+        matched = tool_resolution.get("matched_tools") or []
+        rag_snippet = (rag_context or "")[:400]
+        if workflow == "password_recovery" and matched:
+            steps = build_password_recovery_plan_steps(matched)
+            if steps:
+                return {
+                    "title": "密码找回诊断与执行方案",
+                    "intent": intent,
+                    "phenomenon": content[:300],
+                    "possible_causes": [
+                        "用户忘记登录密码",
+                        "账户因多次失败被 faillock 锁定",
+                        "SSH 不可达需离线 GRUB/救援改密",
+                        "密码不符合复杂度策略",
+                    ],
+                    "steps": steps,
+                    "analysis_summary": tool_resolution.get("reason"),
+                    "rag_reference": rag_snippet[:200] if rag_snippet else None,
+                    "risk_note": "L5 改密需管理员审批；禁止直接修改 /etc/shadow。",
+                    "requires_confirm": True,
+                    "plan_origin": "tool_resolution",
+                    "workflow": workflow,
+                    "matched_tools": matched,
+                }
+        elif workflow == "custom_tools" and matched:
+            steps = []
+            for i, name in enumerate(matched[:6], start=1):
+                hint = next(
+                    (h for h in (tool_resolution.get("tool_hints") or []) if h.get("name") == name),
+                    {"description": name},
+                )
+                steps.append({
+                    "order": i,
+                    "action": hint.get("description") or name,
+                    "tool_hint": name,
+                    "risk": "L1",
+                })
+            if steps:
+                return {
+                    "title": "工具库可执行方案",
+                    "intent": intent,
+                    "phenomenon": content[:300],
+                    "possible_causes": ["已匹配管理员注册的可执行工具"],
+                    "steps": steps,
+                    "analysis_summary": tool_resolution.get("reason"),
+                    "rag_reference": rag_snippet[:200] if rag_snippet else None,
+                    "risk_note": "按工具风险等级触发审批与确认。",
+                    "requires_confirm": True,
+                    "plan_origin": "tool_resolution",
+                    "workflow": workflow,
+                    "matched_tools": matched,
+                }
 
     steps = []
     planned_commands = []

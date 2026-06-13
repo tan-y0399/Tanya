@@ -199,6 +199,7 @@ function tabStat(tab: (typeof MODULE_TABS)[number]) {
   if (!tab.key || !props.stats) return 0
   const key = 'statKey' in tab ? tab.statKey : tab.key
   if (tab.key === '') return props.stats.total
+  if (key === 'blocked_injection') return props.stats.byEventType?.blocked_injection ?? 0
   return props.stats.byEventType?.[key as string] ?? 0
 }
 

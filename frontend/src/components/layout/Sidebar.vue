@@ -173,12 +173,13 @@
 import { computed, ref, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
+import { useApprovalStore } from '@/stores/approval'
 import { logout } from '@/api/auth'
-import { getPendingApprovals } from '@/api/approval'
 import { getSessions } from '@/api/chat'
 
 const router = useRouter()
 const userStore = useUserStore()
+const approvalStore = useApprovalStore()
 
 const isAdmin = computed(() => userStore.userInfo?.role === 'admin')
 const username = computed(() => userStore.userInfo?.username || '用户')
@@ -189,7 +190,7 @@ const roleLabel = computed(() => {
 })
 
 const activeChatCount = ref(0)
-const pendingCount = ref(0)
+const pendingCount = computed(() => approvalStore.pendingTotal)
 let statusTimer: ReturnType<typeof setInterval> | null = null
 
 async function doLogout() {
@@ -203,18 +204,17 @@ async function refreshStatus() {
     const sessions = await getSessions(1, 1)
     activeChatCount.value = sessions?.total || 0
   } catch {}
-  try {
-    const pending = await getPendingApprovals()
-    pendingCount.value = pending?.total || 0
-  } catch {}
+  await approvalStore.refreshPending()
 }
 
 onMounted(() => {
+  approvalStore.startPolling(5000)
   refreshStatus()
   statusTimer = setInterval(refreshStatus, 15000)
 })
 
 onUnmounted(() => {
+  approvalStore.stopPolling()
   if (statusTimer) clearInterval(statusTimer)
 })
 </script>

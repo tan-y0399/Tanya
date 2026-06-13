@@ -1,0 +1,20 @@
+{
+  "name": "verify_account_after_reset",
+  "description": "生成改密后验证命令：账户未锁定、getent 可查、家目录权限正常、shadow 状态有效。确认在线改密成功且用户可登录。",
+  "category": "system_operation",
+  "riskLevel": 2,
+  "enabled": true,
+  "trialArgs": {
+    "username": "kylin"
+  },
+  "config": {
+    "handler": "password_recovery",
+    "parameters": {
+      "username": {
+        "type": "string",
+        "required": true
+      }
+    }
+  },
+  "python": "\"\"\"KylinOps 工具：verify_account_after_reset — 改密后验证账户状态\"\"\"\nNAME = \"verify_account_after_reset\"\nDESCRIPTION = (\n    \"生成改密后验证命令：账户未锁定、getent 可查、家目录权限正常、\"\n    \"shadow 状态有效。确认在线改密成功且用户可登录。\"\n)\nCATEGORY = \"system_operation\"\nRISK_LEVEL = 2\n\nTRIAL_ARGS = {\"username\": \"kylin\"}\n\n\ndef _cmds(username: str):\n    u = username.replace(\"'\", \"\")\n    return [\n        {\"command\": f\"getent passwd {u}\", \"purpose\": \"确认账户仍存在于 NSS\"},\n        {\"command\": f\"faillock --user {u} 2>/dev/null | tail -n +1 || echo 'faillock-ok-or-n/a'\", \"purpose\": \"确认未被 faillock 锁定\"},\n        {\"command\": f\"id {u}\", \"purpose\": \"确认 UID/GID 未变\"},\n        {\n            \"command\": (\n                f\"H=$(getent passwd {u} | cut -d: -f6); \"\n                f\"ls -ld \\\"$H\\\" 2>/dev/null || echo homedir-check-failed\"\n            ),\n            \"purpose\": \"家目录存在且权限合理（通常 drwx------ 或 drwxr-xr-x）\",\n        },\n        {\n            \"command\": f\"grep -E '^{u}:' /etc/shadow 2>/dev/null | cut -d: -f2 | head -c 5 || echo shadow-n/a\",\n            \"purpose\": \"shadow 哈希非空且非 !! 锁定占位\",\n        },\n    ]\n\n\ndef run(**kwargs):\n    username = (kwargs.get(\"username\") or kwargs.get(\"user\") or \"\").strip()\n    if not username:\n        return {\"success\": False, \"error\": \"请提供 username 参数\"}\n\n    return {\n        \"success\": True,\n        \"data\": {\n            \"tool\": NAME,\n            \"execution_mode\": \"remote_ssh\",\n            \"username\": username,\n            \"commands\": _cmds(username),\n            \"pass_criteria\": [\n                \"getent passwd 有输出\",\n                \"faillock 无失败记录或已 reset\",\n                \"家目录 ls -ld 成功\",\n                \"shadow 第二字段为 $ 开头的哈希而非 !! 或空\",\n            ],\n            \"on_failure\": {\n                \"locked\": \"执行 faillock --user {user} --reset\",\n                \"homedir\": \"检查家目录路径与属主 chown\",\n                \"shadow\": \"勿手改 shadow，重新执行 reset_user_password\",\n            },\n            \"agent_instruction\": \"reset_user_password 成功后执行本工具 commands，全部通过则告知用户用新密码登录\",\n            \"trial_simulated\": {\n                \"username\": username,\n                \"verified\": True,\n                \"checks_passed\": 4,\n            },\n            \"summary\": f\"已生成用户「{username}」改密后验证命令\",\n        },\n    }\n"
+}

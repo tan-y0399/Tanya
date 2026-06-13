@@ -105,6 +105,8 @@ export interface SendMessageCallbacks {
   onSummaryDone?: () => void
   onToolCallsUpdated?: (payload: { messageId?: string; toolCalls?: any[] }) => void
   onDiagnosticPlan?: (payload: any) => void
+  onDiagnosticPlanStart?: (payload: any) => void
+  onDiagnosticPlanDelta?: (payload: any) => void
   onEnvPrecheck?: (payload: any) => void
   onPlanProgress?: (payload: any) => void
   onRouteDispatch?: (payload: any) => void
@@ -140,6 +142,8 @@ function dispatchSseEvent(eventName: string, payload: any, cbs: SendMessageCallb
     case 'error_fallback': cbs.onErrorFallback?.(payload); break
     case 'risk_notice': cbs.onRiskNotice?.(payload); break
     case 'permission_notice': cbs.onPermissionNotice?.(payload); break
+    case 'diagnostic_plan_start': cbs.onDiagnosticPlanStart?.(payload); break
+    case 'diagnostic_plan_delta': cbs.onDiagnosticPlanDelta?.(payload); break
     case 'diagnostic_plan': cbs.onDiagnosticPlan?.(payload); break
     case 'env_precheck': cbs.onEnvPrecheck?.(payload); break
     case 'plan_progress': cbs.onPlanProgress?.(payload); break

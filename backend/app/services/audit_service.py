@@ -389,7 +389,9 @@ def _summarize_group(rows: List[AuditRecord], users_map: dict) -> dict:
         tool_count += len((_parse_detail(r.detail_json).get("tools") or []))
 
     summary = (first_detail.get("question") or first.summary or latest.summary or "").strip()
-    if len(rows) > 1 and summary:
+    if latest.event_type == "blocked_injection":
+        summary = latest.summary or summary
+    if len(rows) > 1 and summary and latest.event_type != "blocked_injection":
         summary = summary[:120]
 
     user = users_map.get(latest.user_id)
@@ -412,6 +414,13 @@ def _summarize_group(rows: List[AuditRecord], users_map: dict) -> dict:
         "turnCount": len(rows),
         "traceIds": [r.trace_id for r in rows],
     }
+
+    if latest.event_type == "blocked_injection":
+        block_detail = latest_detail
+        item["flowStatus"] = block_detail.get("flow_status") or "blocked"
+        item["blockReason"] = block_detail.get("reason") or latest.summary or ""
+        item["blockStage"] = block_detail.get("stage") or "prompt_injection"
+        item["blockSeverity"] = block_detail.get("severity") or "high"
 
     workflow_row = next((r for r in reversed(rows) if r.event_type == "workflow"), None)
     if workflow_row is None and latest.event_type == "workflow":
@@ -462,15 +471,14 @@ async def get_audit_stats(db: AsyncSession) -> dict:
 
     l3_plus = await _count_groups(db, [AuditRecord.risk_level.in_(["L3", "L4", "L5"])])
 
-    blocked = await _count_groups(db, [
-        or_(AuditRecord.event_type == "blocked_injection", AuditRecord.risk_level == "L5")
-    ])
-
     by_event_type = {}
     for et in ("chat", "chat_resume", "blocked_injection", "workflow"):
         by_event_type[et] = await _count_groups(
             db, [AuditRecord.event_type == et], event_type=et,
         )
+
+    # 安全拦截：仅统计入口闸门阻断（blocked_injection），不含对话中 L5 审批类命令
+    blocked = by_event_type.get("blocked_injection", 0)
 
     return {
         "total": total,

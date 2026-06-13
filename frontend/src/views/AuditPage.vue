@@ -89,7 +89,10 @@
       </div>
       <div v-else-if="!searchLoading" class="empty-state">
         <AuditIcon name="empty-list" tone="muted" size="lg" boxed />
-        <p>暂无符合条件的审计记录</p>
+        <p>{{ emptyStateText }}</p>
+        <span v-if="activeTab === 'blocked_injection'" class="empty-hint">
+          入口安全闸门拦截（注入检测）会在此归档；L5 审批类命令请查看「Agent 对话」或「审批恢复」
+        </span>
       </div>
 
       <div v-if="total > filters.size" class="pagination-row">
@@ -163,6 +166,11 @@ const isWorkflowTab = computed(() => activeTab.value === 'workflow')
 const sectionTitleText = computed(() => sectionTitle(activeTab.value))
 const sectionTipText = computed(() => sectionTip(activeTab.value, total.value))
 
+const emptyStateText = computed(() => {
+  if (activeTab.value === 'blocked_injection') return '暂无安全拦截记录'
+  return '暂无符合条件的审计记录'
+})
+
 const heroModules = computed(() =>
   HERO_MODULES.map((m) => ({
     ...m,
@@ -225,6 +233,7 @@ function onTabChange(key: string) {
   filters.eventType = key
   filters.page = 1
   loadRecords()
+  if (key === 'blocked_injection') loadStats()
 }
 
 function onPageChange(page: number) {
@@ -530,7 +539,14 @@ onMounted(refreshAll)
   flex-direction: column;
   align-items: center;
   gap: 12px;
-  p { margin: 0; }
+  p { margin: 0; font-weight: 600; color: #64748b; }
+  .empty-hint {
+    max-width: 420px;
+    font-size: 12px;
+    line-height: 1.5;
+    color: #94a3b8;
+    font-weight: 400;
+  }
 }
 
 .pagination-row {

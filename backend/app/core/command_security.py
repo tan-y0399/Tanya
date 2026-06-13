@@ -495,6 +495,37 @@ def analyze_command(command: str) -> Dict:
     if any("安全文件" in d.get("description", "") for d in dangerous):
         base["require_confirm"] = True
 
+    # 密码找回 / 账户诊断只读命令（L1 直接执行，不进审批中心）
+    _PASSWORD_READONLY = (
+        (re.compile(r"^whoami(\s|$)", re.I), "确认当前 SSH 登录账号"),
+        (re.compile(r"^hostname(\s|$)", re.I), "确认主机名"),
+        (re.compile(r"^id\s+\S+", re.I), "查询用户 UID/GID"),
+        (re.compile(r"^getent\s+passwd\s+\S+", re.I), "查询账户信息"),
+        (re.compile(r"^chage\s+-l\s+\S+", re.I), "查询密码过期策略"),
+        (re.compile(r"^faillock\s+--user\s+\S+", re.I), "查询账户锁定状态"),
+        (re.compile(r"^test\s+-d\s+", re.I), "检查家目录是否存在"),
+        (re.compile(r"^cat\s+/etc/security/pwquality\.conf", re.I), "读取密码复杂度策略"),
+        (re.compile(r"^grep\s+-E.*(/etc/login\.defs|PASS_(MAX|MIN|WARN)_DAYS|ENCRYPT_METHOD)", re.I), "读取 login.defs 策略"),
+        (re.compile(r"^echo\s+kylinops-ssh-ok", re.I), "SSH 连通性探针"),
+    )
+    for pattern, reason in _PASSWORD_READONLY:
+        if pattern.search(command.strip()):
+            base["risk_level"] = RiskLevel.SAFE.value
+            base["require_approval"] = False
+            base["require_confirm"] = False
+            base["reason"] = reason
+            return base
+
+    # 在线改密（L5 必须管理员审批）
+    if re.search(r"\bchpasswd\b", command, re.I) or re.search(r"\bpasswd\s+--stdin\b", command, re.I):
+        base["group"] = CommandGroup.USER_MANAGEMENT.value
+        base["group_name"] = GROUP_CONFIG[CommandGroup.USER_MANAGEMENT]["name"]
+        base["risk_level"] = RiskLevel.FATAL.value
+        base["require_approval"] = True
+        base["require_confirm"] = True
+        base["reason"] = "在线重置用户密码（高风险）"
+        return base
+
     # 时间同步：只读查询（L1 直接执行）
     _TIME_READONLY = (
         (re.compile(r"^timedatectl\s+(status|show|timesync-status|show-timesync-status)\b", re.I), "查看时间同步状态"),
@@ -550,9 +581,10 @@ def analyze_command(command: str) -> Dict:
     # L1: 命令分组（不覆盖已有的高风险标记）
     group = get_command_group(cmd_name)
     if group is None:
-        base["require_approval"] = max(base["require_approval"], True)
-        base["require_confirm"] = max(base["require_confirm"], True)
-        base["reason"] = "未知命令，默认中等风险"
+        base["require_approval"] = False
+        base["require_confirm"] = True
+        base["risk_level"] = RiskLevel.LOW.value
+        base["reason"] = "未知命令，需用户确认后执行"
         return base
 
     config = GROUP_CONFIG[group]

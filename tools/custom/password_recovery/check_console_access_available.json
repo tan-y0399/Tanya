@@ -1,0 +1,40 @@
+{
+  "name": "check_console_access_available",
+  "description": "询问并记录用户是否拥有目标虚拟机控制台访问能力（VMware/VirtualBox/VNC/物理显示器/IPMI）。离线密码恢复（GRUB/LiveCD）必须在控制台操作，本工具用于分支判断：仅指引或可走在线改密。",
+  "category": "system_operation",
+  "riskLevel": 1,
+  "enabled": true,
+  "trialArgs": {
+    "has_console": true,
+    "console_type": "vmware",
+    "target_host": "192.168.1.100"
+  },
+  "config": {
+    "handler": "password_recovery",
+    "parameters": {
+      "has_console": {
+        "type": "boolean",
+        "required": true,
+        "description": "用户是否能打开虚拟机控制台"
+      },
+      "console_type": {
+        "type": "string",
+        "enum": [
+          "vmware",
+          "virtualbox",
+          "vnc",
+          "physical",
+          "ipmi",
+          "unknown"
+        ]
+      },
+      "target_host": {
+        "type": "string"
+      },
+      "notes": {
+        "type": "string"
+      }
+    }
+  },
+  "python": "\"\"\"KylinOps 工具：check_console_access_available — 确认是否有虚拟机控制台\"\"\"\nNAME = \"check_console_access_available\"\nDESCRIPTION = (\n    \"询问并记录用户是否拥有目标虚拟机控制台访问能力（VMware/VirtualBox/VNC/物理显示器/IPMI）。\"\n    \"离线密码恢复（GRUB/LiveCD）必须在控制台操作，本工具用于分支判断：仅指引或可走在线改密。\"\n)\nCATEGORY = \"system_operation\"\nRISK_LEVEL = 1\n\nTRIAL_ARGS = {\n    \"has_console\": True,\n    \"console_type\": \"vmware\",\n    \"target_host\": \"192.168.1.100\",\n}\n\nCONSOLE_TYPES = {\n    \"vmware\": \"VMware Workstation / ESXi 控制台\",\n    \"virtualbox\": \"VirtualBox 图形控制台\",\n    \"vnc\": \"VNC / 远程 KVM\",\n    \"physical\": \"物理机显示器 + 键盘\",\n    \"ipmi\": \"IPMI / iLO / iDRAC 带外\",\n    \"unknown\": \"未明确\",\n}\n\n\ndef run(**kwargs):\n    has_console = kwargs.get(\"has_console\")\n    if has_console is None:\n        has_console = kwargs.get(\"console_available\")\n    console_type = (kwargs.get(\"console_type\") or \"unknown\").strip().lower()\n    target_host = (kwargs.get(\"target_host\") or kwargs.get(\"host\") or \"\").strip()\n    notes = (kwargs.get(\"notes\") or \"\").strip()\n\n    if has_console is None:\n        return {\n            \"success\": False,\n            \"error\": \"请提供 has_console（true/false）表示用户是否能打开虚拟机控制台\",\n        }\n\n    has_console = bool(has_console)\n    label = CONSOLE_TYPES.get(console_type, CONSOLE_TYPES[\"unknown\"])\n\n    if has_console:\n        route = \"offline_playbook\"\n        summary = f\"用户具备控制台访问（{label}），可走 GRUB/救援/LiveCD 离线恢复流程\"\n        next_tools = [\"get_password_recovery_playbook\"]\n        warnings = []\n    else:\n        route = \"online_or_escalate\"\n        summary = \"用户无控制台访问，无法执行 GRUB/LiveCD 离线改密，需尝试 SSH 在线改密或联系机房带外\"\n        next_tools = [\"check_ssh_connectivity\", \"reset_user_password\"]\n        warnings = [\"离线恢复必须在控制台完成，Agent 无法远程代替按键操作\"]\n\n    return {\n        \"success\": True,\n        \"data\": {\n            \"tool\": NAME,\n            \"target_host\": target_host,\n            \"has_console\": has_console,\n            \"console_type\": console_type,\n            \"console_label\": label,\n            \"notes\": notes,\n            \"recommended_route\": route,\n            \"next_tools\": next_tools,\n            \"warnings\": warnings,\n            \"agent_questions\": [\n                \"您是否能打开该虚拟机的控制台窗口（VMware/VirtualBox/物理屏幕）？\",\n                \"控制台类型是 VMware、VirtualBox、VNC 还是物理机？\",\n            ],\n            \"summary\": summary,\n        },\n    }\n"
+}
