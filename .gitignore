@@ -19,9 +19,13 @@ backend/venv/
 
 # Database files
 *.db
+*.db-shm
+*.db-wal
 *.sqlite3
 backend/data/*.db
+backend/data/*.db-*
 backend/data/audit.db
+backend/data/feedback_uploads/
 
 # Environment & secrets
 .env

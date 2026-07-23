@@ -47,9 +47,15 @@ def _get_default_gateway() -> Optional[str]:
 
 
 def _ping_once(host: str, timeout: int = 2) -> bool:
+    """跨平台 ping（Windows 用 -n/-w，Linux/macOS 用 -c/-W）。"""
     try:
+        if os.name == "nt":
+            # Windows: -n 次数；-w 超时毫秒
+            cmd = ["ping", "-n", "1", "-w", str(max(timeout, 1) * 1000), host]
+        else:
+            cmd = ["ping", "-c", "1", "-W", str(timeout), host]
         result = subprocess.run(
-            ["ping", "-c", "1", "-W", str(timeout), host],
+            cmd,
             capture_output=True,
             timeout=timeout + 2,
             check=False,

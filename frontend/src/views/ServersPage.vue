@@ -280,9 +280,12 @@ async function handleCheckReachable() {
     reachMessage.value = res.message
     reachSuggestions.value = res.suggestions || []
     reachDiagnosis.value = { localIp: res.localIp, sameSubnet: res.sameSubnet }
-  } catch {
+  } catch (e: any) {
     reachOk.value = false
-    reachMessage.value = '连通性检测失败'
+    const detail = e?.response?.data?.detail || e?.message || ''
+    reachMessage.value = detail
+      ? `连通性检测失败：${typeof detail === 'string' ? detail : JSON.stringify(detail)}`
+      : '连通性检测失败（请确认后端已启动且前端代理端口正确）'
   } finally {
     reachChecking.value = false
   }

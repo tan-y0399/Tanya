@@ -18,10 +18,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/dashboard", tags=["仪表盘"])
 
 # 线程池用于并行执行 SSH 调用（避免阻塞事件循环）
-_executor = ThreadPoolExecutor(max_workers=4)
+_executor = ThreadPoolExecutor(max_workers=8)
 
-# 单次 SSH 调用的超时秒数（SSH 层有重试，单个调用可设短些）
-SSH_CALL_TIMEOUT = 3
+# 单次 SSH 调用的超时秒数（Windows→VM NAT 场景下握手偏慢，过短会导致服务状态误判）
+SSH_CALL_TIMEOUT = 12
 
 # 内存缓存（仪表盘数据过期时间）
 _CACHE_TTL = 10  # 秒（实时趋势）
@@ -266,31 +266,25 @@ def _call_ssh_with_timeout(func, *args, **kwargs):
 
 
 def _fetch_vm_metrics_parallel(server_id: str = None):
-    """并行从远程VM获取实时指标（4个SSH调用同时进行）"""
+    """从远程 VM 采集指标。
+
+    注意：同一 SSHClient/paramiko 连接不可多线程并发 exec，
+    因此改为顺序采集，避免仪表盘服务状态被并发写坏。
+    """
     from app.services.remote_executor import get_system_info, get_cpu_info, get_memory_info, get_disk_info
 
-    tasks = [
-        ("cpu", get_cpu_info, server_id),
-        ("memory", get_memory_info, server_id),
-        ("disk", get_disk_info, server_id),
-        ("system", get_system_info, server_id),
-    ]
-
-    futures = {}
-    for name, func, sid in tasks:
-        futures[name] = _executor.submit(func, sid)
-
     metrics = {}
-    for name in futures:
+    for name, func in (
+        ("cpu", get_cpu_info),
+        ("memory", get_memory_info),
+        ("disk", get_disk_info),
+        ("system", get_system_info),
+    ):
         try:
-            metrics[name] = futures[name].result(timeout=SSH_CALL_TIMEOUT)
-        except FutureTimeout:
-            logger.warning(f"Metric {name} SSH call timed out")
-            metrics[name] = {"success": False, "error": "超时"}
+            metrics[name] = func(server_id)
         except Exception as e:
             logger.warning(f"Metric {name} SSH call failed: {e}")
             metrics[name] = {"success": False, "error": str(e)}
-
     return metrics
 
 
@@ -338,8 +332,8 @@ def _check_kylinops_backend_local() -> dict:
 
 
 def _check_services_parallel(server_id: str = None):
-    """并行检查多个服务状态（批量查询，减少 SSH 调用次数）"""
-    from app.services.remote_executor import run_command
+    """检查远程基础设施服务状态（在线程池 worker 内同步执行，避免二次 submit 死锁）。"""
+    from app.services.ssh_client import get_ssh_for_server_sync
 
     remote_services = [
         {"name": "PostgreSQL", "port": 5432, "unit": "postgresql"},
@@ -347,19 +341,24 @@ def _check_services_parallel(server_id: str = None):
         {"name": "Redis", "port": 6379, "unit": "redis"},
     ]
 
-    # 批量查询远程/平台基础设施服务状态（一次 SSH 调用）
     status_cmd = "; ".join(
-        f"echo '==={svc['unit']}==='; systemctl is-active {svc['unit']} 2>/dev/null || echo 'unknown'"
+        f"echo '==={svc['unit']}==='; systemctl is-active {svc['unit']} 2>/dev/null || echo unknown"
         for svc in remote_services
     )
-    status_result = _call_ssh_with_timeout(run_command, status_cmd, server_id=server_id)
-
     status_map = {}
-    if status_result.get("success") and status_result.get("data"):
-        raw = status_result["data"].get("stdout", "")
-        status_map = _parse_kv(raw)
+    try:
+        ssh = get_ssh_for_server_sync(server_id)
+        out, _err, _code = ssh.execute(status_cmd)
+        status_map = _parse_kv(out or "")
+        logger.info(
+            "service status probe server_id=%s parsed=%s raw=%r",
+            server_id,
+            {k: status_map.get(k) for k in ("postgresql", "nginx", "redis")},
+            (out or "")[:200],
+        )
+    except Exception as e:
+        logger.warning("service status SSH probe failed: %s", e)
 
-    # 批量查询运行中服务的 uptime（一次 SSH 调用）
     running_units = [svc["unit"] for svc in remote_services if status_map.get(svc["unit"], "").strip() == "active"]
     uptime_map = {}
     if running_units:
@@ -367,10 +366,12 @@ def _check_services_parallel(server_id: str = None):
             f"echo '==={u}==='; systemctl show {u} -p ActiveEnterTimestamp 2>/dev/null | cut -d= -f2"
             for u in running_units
         )
-        uptime_result = _call_ssh_with_timeout(run_command, uptime_cmd, server_id=server_id)
-        if uptime_result.get("success") and uptime_result.get("data"):
-            raw = uptime_result["data"].get("stdout", "")
-            uptime_map = _parse_kv(raw)
+        try:
+            ssh = get_ssh_for_server_sync(server_id)
+            out, _err, _code = ssh.execute(uptime_cmd)
+            uptime_map = _parse_kv(out or "")
+        except Exception as e:
+            logger.debug("service uptime probe failed: %s", e)
 
     results = []
     for svc in remote_services:
@@ -412,29 +413,30 @@ async def dashboard_overview(server_id: str = None, db: AsyncSession = Depends(g
     else:
         loop = asyncio.get_event_loop()
 
-        # 并行执行 SSH 指标采集和服务检查
-        metrics_future = loop.run_in_executor(_executor, _fetch_vm_metrics_parallel, server_id)
-        services_future = loop.run_in_executor(_executor, _check_services_parallel, server_id)
+        # 指标与服务状态共用同一 SSH 连接，必须串行，避免 paramiko 并发 exec 损坏结果
+        def _collect_all():
+            m = _fetch_vm_metrics_parallel(server_id)
+            s = _check_services_parallel(server_id)
+            return m, s
 
         try:
-            vm_metrics = await asyncio.wait_for(metrics_future, timeout=SSH_CALL_TIMEOUT + 2)
+            vm_metrics, services = await asyncio.wait_for(
+                loop.run_in_executor(_executor, _collect_all),
+                timeout=SSH_CALL_TIMEOUT * 3,
+            )
         except asyncio.TimeoutError:
-            vm_metrics = {}
-            logger.warning("Dashboard metrics fetch timed out, will try stale cache")
+            vm_metrics, services = {}, []
+            logger.warning("Dashboard SSH collect timed out")
 
-        try:
-            services = await asyncio.wait_for(services_future, timeout=SSH_CALL_TIMEOUT + 4)
-        except asyncio.TimeoutError:
-            services = []
-
-        # SSH 全部失败时，回退到旧缓存数据
+        # SSH 全部失败时，回退到旧缓存数据（但不要用旧的 unknown 覆盖已采到的服务状态）
         has_metrics = any(
             isinstance(vm_metrics.get(k, {}), dict) and vm_metrics.get(k, {}).get("success")
             for k in ["cpu", "memory", "disk"]
         )
         if not has_metrics and cache_entry:
             vm_metrics = cache_entry.get("metrics", vm_metrics)
-            services = cache_entry.get("services", services)
+            if not services:
+                services = cache_entry.get("services", services)
             fresh_data = False
         else:
             # 缓存新结果

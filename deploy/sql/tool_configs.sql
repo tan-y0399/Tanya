@@ -1,0 +1,12 @@
+-- KylinOps 工具 SQL 导入说明
+--
+-- SQLite（默认单机部署）:
+--   deploy/sql/tool_configs.sqlite.sql
+--
+-- PostgreSQL:
+--   deploy/sql/tool_configs.postgresql.sql
+--
+-- 重新生成（修改 tools/custom/ 后）:
+--   cd backend && python scripts/generate_tools_sql.py
+
+-- 请使用 dialect 专用文件，见上方说明

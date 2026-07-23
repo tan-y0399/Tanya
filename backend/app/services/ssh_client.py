@@ -71,25 +71,52 @@ class SSHClient:
             self.connect()
         return self._client
 
+    def _resolve_key_path(self) -> str:
+        """解析私钥路径；配置的文件不存在时回退到常见密钥名（Windows 常只有 id_ed25519）。"""
+        candidates = []
+        if self.key_path:
+            candidates.append(os.path.expanduser(self.key_path))
+        home_ssh = os.path.join(os.path.expanduser("~"), ".ssh")
+        for name in ("id_ed25519", "id_rsa", "id_ecdsa"):
+            candidates.append(os.path.join(home_ssh, name))
+        seen = set()
+        for path in candidates:
+            norm = os.path.normpath(path)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            if os.path.isfile(norm):
+                return norm
+        raise FileNotFoundError(
+            f"未找到可用私钥（已尝试: {', '.join(seen)}）。"
+            "请生成密钥或先在服务器管理中用密码完成 AUTO SSH PROVISION。"
+        )
+
     def connect(self) -> None:
         """建立 SSH 连接，启用 keepalive 防止空闲断开。"""
         self.username = assert_allowed_ssh_user(self.username)
         self._client = paramiko.SSHClient()
         self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
-            key_path = os.path.expanduser(self.key_path)
+            key_path = self._resolve_key_path()
             key = _load_private_key(key_path)
+            # Windows / 虚拟机 NAT 场景下偶发 banner 慢读，单独放宽 banner/auth 超时
+            banner_timeout = max(int(self.timeout), 30)
             self._client.connect(
                 hostname=self.host,
                 port=self.port,
                 username=self.username,
                 pkey=key,
                 timeout=self.timeout,
+                banner_timeout=banner_timeout,
+                auth_timeout=banner_timeout,
+                allow_agent=False,
+                look_for_keys=False,
             )
             transport = self._client.get_transport()
             if transport:
                 transport.set_keepalive(30)
-            logger.info(f"SSH connected to {self.host}")
+            logger.info(f"SSH connected to {self.host} with key {key_path}")
         except Exception as e:
             logger.error(f"SSH connect failed: {e}")
             raise
