@@ -16,6 +16,7 @@ from app.models.server import Server
 from app.api.routes import auth, chat, audit, approval, system, dashboard, knowledge, alerts, servers, users, tools, feedback, trace_outcome
 from app.models.supervision import SupervisionPlan, TraceOutcome
 from app.models.execution_log import ExecutionLog
+from app.models.multimodal import MessageAttachment, KnowledgeAsset
 from app.api.routes.knowledge import seed_knowledge
 # from app.mcp.server import router as mcp_router
 
@@ -189,6 +190,8 @@ app.include_router(trace_outcome.router, prefix="/api/v1")
 # app.include_router(mcp_router)
 
 from app.services.feedback_upload import feedback_upload_dir as _feedback_upload_dir
+from app.services.image_store import chat_upload_dir as _chat_upload_dir
+from app.services.multimodal_assets import generated_asset_dir as _generated_asset_dir
 
 _fb_upload_path = _feedback_upload_dir()
 if _fb_upload_path.is_dir():
@@ -196,6 +199,22 @@ if _fb_upload_path.is_dir():
         "/api/v1/feedback/files",
         StaticFiles(directory=str(_fb_upload_path)),
         name="feedback_files",
+    )
+
+_chat_upload_path = _chat_upload_dir()
+if _chat_upload_path.is_dir():
+    app.mount(
+        "/api/v1/chat/files",
+        StaticFiles(directory=str(_chat_upload_path)),
+        name="chat_files",
+    )
+
+_generated_asset_path = _generated_asset_dir()
+if _generated_asset_path.is_dir():
+    app.mount(
+        "/api/v1/chat/generated",
+        StaticFiles(directory=str(_generated_asset_path)),
+        name="chat_generated_assets",
     )
 
 if os.path.isdir(FRONTEND_DIST):

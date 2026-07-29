@@ -61,7 +61,7 @@ export interface PlanProgressPayload {
   currentStepAction?: string | null
   currentStatus?: string
   brief?: string
-  steps?: { order: number; action: string; status: string }[]
+  steps?: { order: number; action: string; status: string; core?: boolean }[]
 }
 
 const props = defineProps<{

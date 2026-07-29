@@ -871,6 +871,8 @@ def _parse_plan_step_to_tool(step: dict, plan_data: dict = None) -> Optional[tup
         if m:
             top_n = min(int(m.group(1)), 50)
         return ("list_processes", {"sort_by": sort_by, "top_n": top_n})
+    if "get_system_info" in hint:
+        return ("get_system_info", {})
     if "get_cpu_info" in hint:
         return ("get_cpu_info", {})
     if "get_memory_info" in hint:
@@ -2255,6 +2257,11 @@ async def get_messages(db: AsyncSession, session_id: str, page: int = 1, size: i
     total = total_result.scalar() or 0
     rows_result = await db.execute(q.offset((page - 1) * size).limit(size))
     rows = rows_result.scalars().all()
+    try:
+        from app.services.image_store import list_message_attachments
+        attachments_by_message = await list_message_attachments(db, [m.id for m in rows])
+    except Exception:
+        attachments_by_message = {}
 
     items = []
     for m in rows:
@@ -2267,6 +2274,7 @@ async def get_messages(db: AsyncSession, session_id: str, page: int = 1, size: i
         items.append({
             "id": m.id, "role": m.role, "content": m.content or "",
             "toolCalls": tool_calls, "traceId": m.trace_id,
+            "attachments": attachments_by_message.get(m.id, []),
             "createdAt": m.created_at.isoformat() if m.created_at else "",
         })
     return {"items": items, "total": total}

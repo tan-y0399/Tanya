@@ -15,6 +15,7 @@ ENV/
 env/
 .venv/
 backend/.venv_linux/
+backend/.venv_runtime/
 backend/venv/
 
 # Database files
@@ -26,9 +27,14 @@ backend/data/*.db
 backend/data/*.db-*
 backend/data/audit.db
 backend/data/feedback_uploads/
+backend/data/chat_uploads/
+backend/data/generated_assets/
+backend/data/dashboard_history.json
 
-# Environment & secrets
+# Environment & secrets（真实 Key 只放本地 .env，禁止入库）
 .env
+**/.env
+backend/.env
 .env.local
 .env.*.local
 *.pem

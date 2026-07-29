@@ -1,5 +1,5 @@
 import api from './index'
-import type { Session, Message } from '@/stores/chat'
+import type { Session, Message, ChatAttachment } from '@/stores/chat'
 
 export async function getSessions(page = 1, size = 20) {
   const { data } = await api.get('/chat/sessions', { params: { page, size } })
@@ -44,6 +44,11 @@ export async function getPendingPlan(sessionId: string) {
 export async function cancelAwaitingRun(sessionId: string, payload: { approvalId?: string; pendingExecutionId?: string }) {
   const { data } = await api.post(`/chat/sessions/${sessionId}/cancel-run`, payload)
   return data
+}
+
+export async function synthesizeSpeech(payload: { text: string; voice?: string; speed?: number }) {
+  const { data } = await api.post('/chat/tts', payload)
+  return data.data
 }
 
 export interface RollbackToolStatus {
@@ -112,6 +117,16 @@ export interface SendMessageCallbacks {
   onRouteDispatch?: (payload: any) => void
   onTaskProgress?: (payload: any) => void
   onOpsReport?: (payload: any) => void
+  onVisionResult?: (payload: any) => void
+  onMultimodalRag?: (payload: any) => void
+  onAgentHandoff?: (payload: any) => void
+  onDeepPlan?: (payload: any) => void
+  onWebResearch?: (payload: any) => void
+  onIntentClarification?: (payload: any) => void
+  onImageReview?: (payload: any) => void
+  onImageGeneration?: (payload: any) => void
+  onDiagramResult?: (payload: any) => void
+  onAnswerMedia?: (payload: any) => void
 }
 
 function dispatchSseEvent(eventName: string, payload: any, cbs: SendMessageCallbacks) {
@@ -150,6 +165,16 @@ function dispatchSseEvent(eventName: string, payload: any, cbs: SendMessageCallb
     case 'route_dispatch': cbs.onRouteDispatch?.(payload); break
     case 'task_progress': cbs.onTaskProgress?.(payload); break
     case 'ops_report': cbs.onOpsReport?.(payload); break
+    case 'vision_result': cbs.onVisionResult?.(payload); break
+    case 'multimodal_rag': cbs.onMultimodalRag?.(payload); break
+    case 'agent_handoff': cbs.onAgentHandoff?.(payload); break
+    case 'deep_plan': cbs.onDeepPlan?.(payload); break
+    case 'web_research': cbs.onWebResearch?.(payload); break
+    case 'intent_clarification': cbs.onIntentClarification?.(payload); break
+    case 'image_review': cbs.onImageReview?.(payload); break
+    case 'image_generation': cbs.onImageGeneration?.(payload); break
+    case 'diagram_result': cbs.onDiagramResult?.(payload); break
+    case 'answer_media': cbs.onAnswerMedia?.(payload); break
     default: break
   }
 }
@@ -220,6 +245,9 @@ export function sendMessage(
   pendingExecutionId?: string,
   serverId?: string,
   confirmPlanId?: string,
+  thinkingMode: 'fast' | 'deep' = 'fast',
+  attachments: ChatAttachment[] = [],
+  deepIntentChoice?: 'professional_answer' | 'plan_execute',
 ): AbortController {
   const controller = new AbortController()
   const body: any = { sessionId, content }
@@ -227,6 +255,18 @@ export function sendMessage(
   if (pendingExecutionId) body.pendingExecutionId = pendingExecutionId
   if (serverId) body.serverId = serverId
   if (confirmPlanId) body.confirmPlanId = confirmPlanId
+  if (thinkingMode) body.thinkingMode = thinkingMode
+  if (deepIntentChoice) body.deepIntentChoice = deepIntentChoice
+  if (attachments.length) {
+    body.attachments = attachments.map(a => ({
+      id: a.id,
+      kind: a.kind || 'image',
+      name: a.name,
+      contentType: a.contentType,
+      size: a.size,
+      dataUrl: a.dataUrl,
+    }))
+  }
 
   fetch('/api/v1/chat/send', {
     method: 'POST',
@@ -340,4 +380,4 @@ export function finalizeApprovalRejection(
   })
 }
 
-export type { Session, Message }
+export type { Session, Message, ChatAttachment }

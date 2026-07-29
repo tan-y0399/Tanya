@@ -58,6 +58,22 @@
             </select>
             <span class="server-status-dot" :class="selectedServerStatus"></span>
           </div>
+          <div class="thinking-mode-switch" title="选择 Agent 思考链路">
+            <button
+              type="button"
+              :class="{ active: selectedThinkingMode === 'fast' }"
+              @click="selectedThinkingMode = 'fast'"
+            >
+              快速思考
+            </button>
+            <button
+              type="button"
+              :class="{ active: selectedThinkingMode === 'deep' }"
+              @click="selectedThinkingMode = 'deep'"
+            >
+              深度思考
+            </button>
+          </div>
         </div>
         <div class="topbar-actions">
           <button
@@ -108,7 +124,11 @@
                 <path d="M2 2l6 6M8 2l-6 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
               </svg>
             </button>
-            <UserMessage :content="group.msg.content" :createdAt="group.msg.createdAt" />
+            <UserMessage
+              :content="group.msg.content"
+              :createdAt="group.msg.createdAt"
+              :attachments="group.msg.attachments"
+            />
           </div>
 
           <!-- Agent消息 + 推理链 + 状态卡片 + 工具结果 -->
@@ -130,7 +150,13 @@
               :traceId="agentMainContent(group) ? undefined : group.msg.traceId"
               :hideTrace="!!agentMainContent(group)"
               :createdAt="group.msg.createdAt"
+              :speech-state="speechStateForContent(agentHeaderContent(group))"
+              :speech-error="speechErrorForContent(agentHeaderContent(group))"
               @viewTrace="openTraceTimeline"
+              @copy="copyAssistantContent"
+              @regenerate="regenerateLastQuestion"
+              @speak="speakAssistantContent"
+              @stopSpeak="stopSpeech"
             />
             <!-- 知识问答：流式时思考栏内联 sticky 轻遮罩，结束后自然贴合正文上方（图2） -->
             <div
@@ -149,12 +175,20 @@
                 />
                 <ReasoningChain v-if="chatStore.reasoningSteps.length" :steps="chatStore.reasoningSteps" />
               </div>
-              <div v-if="agentMainContent(group)" class="kb-answer-body">
+              <div v-if="agentMainContent(group) || group.msg.answerMedia?.length" class="kb-answer-body">
                 <AgentMessage
                   :content="agentMainContent(group)"
+                  :media="group.msg.answerMedia"
+                  :streaming="chatStore.isStreaming && group === lastAgentGroup"
                   :traceId="group.msg.traceId"
                   :createdAt="group.msg.createdAt"
                   continuation
+                  :speech-state="speechStateForContent(agentMainContent(group))"
+                  :speech-error="speechErrorForContent(agentMainContent(group))"
+                  @copy="copyAssistantContent"
+                  @regenerate="regenerateLastQuestion"
+                  @speak="speakAssistantContent"
+                  @stopSpeak="stopSpeech"
                 />
               </div>
             </div>
@@ -171,11 +205,19 @@
                 <ReasoningChain v-if="chatStore.reasoningSteps.length" :steps="chatStore.reasoningSteps" />
               </div>
               <AgentMessage
-                v-if="agentMainContent(group)"
+                v-if="agentMainContent(group) || group.msg.answerMedia?.length"
                 :content="agentMainContent(group)"
+                :media="group.msg.answerMedia"
+                :streaming="chatStore.isStreaming && group === lastAgentGroup"
                 :traceId="group.msg.traceId"
                 :createdAt="group.msg.createdAt"
                 continuation
+                :speech-state="speechStateForContent(agentMainContent(group))"
+                :speech-error="speechErrorForContent(agentMainContent(group))"
+                @copy="copyAssistantContent"
+                @regenerate="regenerateLastQuestion"
+                @speak="speakAssistantContent"
+                @stopSpeak="stopSpeech"
               />
             </template>
             <div
@@ -289,6 +331,26 @@
 
         <!-- 待确认命令 / 审批（与工具卡左对齐） -->
         <div v-if="showActionDock" class="agent-aligned-blocks action-dock">
+          <div v-if="intentClarification" class="intent-clarification-card">
+            <div class="intent-clarification-header">
+              <span class="intent-clarification-badge">Supervisor Router</span>
+              <strong>请确认处理目标</strong>
+            </div>
+            <p class="intent-clarification-question">{{ intentClarification.question }}</p>
+            <div class="intent-clarification-actions">
+              <button
+                v-for="opt in intentClarification.options"
+                :key="opt.id"
+                type="button"
+                class="intent-choice-btn"
+                :class="{ primary: opt.id === 'professional_answer' }"
+                @click="handleIntentClarificationSelect(opt)"
+              >
+                <span>{{ opt.title }}</span>
+                <small>{{ opt.description }}</small>
+              </button>
+            </div>
+          </div>
           <CommandConfirmCard
             v-if="pendingAction && !pendingAction.resolved && pendingAction.type === 'confirm'"
             mode="l2"
@@ -399,13 +461,13 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { useChatStore } from '@/stores/chat'
 import { useUserStore } from '@/stores/user'
 import { useApprovalStore } from '@/stores/approval'
-import type { ToolCall, Message } from '@/stores/chat'
+import type { ToolCall, Message, ChatAttachment } from '@/stores/chat'
 import type { RollbackToolStatus } from '@/api/chat'
 import {
   getSessions, createSession, deleteSession, getMessages, sendMessage,
   clearSessionMessages, deleteMessage, getAwaitingRun, getPendingPlan, cancelAwaitingRun,
   rollbackSession, getRollbackStatus,
-  finalizeApprovalRejection, continuePlanExecution,
+  finalizeApprovalRejection, continuePlanExecution, synthesizeSpeech,
 } from '@/api/chat'
 import { approveApproval, rejectApproval, getPendingApprovals, getApprovalById, getApprovalHistory } from '@/api/approval'
 import { getServers, type ServerInfo } from '@/api/servers'
@@ -439,6 +501,7 @@ import StateCards from '@/components/chat/StateCards.vue'
 import { splitAgentContent, TOOLS_CONTENT_MARKER, hasKnowledgeOpener } from '@/utils/splitAgentMessageContent'
 import { mergeConclusionPreservingReport, isLightweightConclusion, extractLastConclusionBlock } from '@/utils/conclusionContent'
 import { toolDisplayName } from '@/utils/toolDisplay'
+import { createSpeechChunks } from '@/utils/speechText'
 
 const route = useRoute()
 const chatStore = useChatStore()
@@ -460,6 +523,7 @@ function toggleSidebar() {
 // 服务器选择器
 const serverList = ref<ServerInfo[]>([])
 const selectedServerId = ref('')
+const selectedThinkingMode = ref<'fast' | 'deep'>('fast')
 
 const selectedServerStatus = computed(() => {
   if (!selectedServerId.value) return 'online'
@@ -521,7 +585,20 @@ interface PendingAction {
   expiresAt?: string
   resolved: boolean
 }
+interface IntentClarificationOption {
+  id: 'professional_answer' | 'plan_execute'
+  title: string
+  description: string
+  prompt: string
+}
+interface IntentClarificationState {
+  traceId?: string
+  question: string
+  originalQuestion: string
+  options: IntentClarificationOption[]
+}
 const pendingAction = ref<PendingAction | null>(null)
+const intentClarification = ref<IntentClarificationState | null>(null)
 const pollTimer = ref<ReturnType<typeof setInterval> | null>(null)
 const awaitingRunTimer = ref<ReturnType<typeof setInterval> | null>(null)
 const waitingApprovalId = ref<string | null>(null)
@@ -547,6 +624,17 @@ const planProgress = ref<PlanProgressPayload | null>(null)
 const continuePlanBusy = ref(false)
 const showTraceFeedback = ref(false)
 const showSessionFeedback = ref(false)
+const speechAudio = ref<HTMLAudioElement | null>(null)
+const speechState = ref<'idle' | 'generating' | 'playing' | 'paused'>('idle')
+const activeSpeechContent = ref('')
+const preferRemoteTts = false
+const speechVoices = ref<SpeechSynthesisVoice[]>([])
+const speechVoice = ref<SpeechSynthesisVoice | null>(null)
+const speechUtterance = ref<SpeechSynthesisUtterance | null>(null)
+const speechChunks = ref<string[]>([])
+const speechChunkIndex = ref(0)
+const speechExpectedCancellation = ref(false)
+const speechError = ref('')
 /** 当前会话待反馈的 trace（与会话绑定，切换会话时不串台） */
 const activeFeedbackTraceId = ref<string | null>(null)
 
@@ -743,6 +831,7 @@ const hasInlinePlanConfirm = computed(() => {
 
 const showActionDock = computed(() => {
   if (hasInlinePlanConfirm.value) return false
+  if (intentClarification.value) return true
   return !!(pendingAction.value && !pendingAction.value.resolved)
     || !!findPendingConfirmTool()
 })
@@ -2366,11 +2455,24 @@ function applyToolResult(result: any) {
 
 async function handleSend(
   text: string,
-  pendingData?: { approvalId?: string; pendingExecutionId?: string; confirmPlanId?: string },
+  attachmentsOrPending?: ChatAttachment[] | {
+    approvalId?: string
+    pendingExecutionId?: string
+    confirmPlanId?: string
+    deepIntentChoice?: 'professional_answer' | 'plan_execute'
+  },
+  maybePendingData?: {
+    approvalId?: string
+    pendingExecutionId?: string
+    confirmPlanId?: string
+    deepIntentChoice?: 'professional_answer' | 'plan_execute'
+  },
 ) {
+  const uploadAttachments = Array.isArray(attachmentsOrPending) ? attachmentsOrPending : []
+  const pendingData = Array.isArray(attachmentsOrPending) ? maybePendingData : attachmentsOrPending
   if (!chatStore.currentSessionId) {
     await handleNewSession()
-    return handleSend(text, pendingData)
+    return handleSend(text, uploadAttachments, pendingData)
   }
 
   const isResume = !!(pendingData?.approvalId || pendingData?.pendingExecutionId || pendingData?.confirmPlanId)
@@ -2382,6 +2484,9 @@ async function handleSend(
   }
 
   if (!isResume) {
+    if (!text.trim() && uploadAttachments.length) {
+      text = '请分析我上传的图片'
+    }
     const pre = validateChatInput(text)
     if (!pre.valid) {
       chatStore.addMessage({
@@ -2396,13 +2501,18 @@ async function handleSend(
     if (chatStore.currentSessionId) {
       clearPendingFeedbackTrace(chatStore.currentSessionId)
     }
+    intentClarification.value = null
     diagnosticPlan.value = null
     if (!isResume) {
       planRiskMessage.value = null
     }
     const msgId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
     const userMsg: Message = {
-      id: msgId, role: 'user', content: text, createdAt: new Date().toISOString(),
+      id: msgId,
+      role: 'user',
+      content: text,
+      attachments: uploadAttachments.map(a => ({ ...a, url: a.url || a.dataUrl })),
+      createdAt: new Date().toISOString(),
     }
     chatStore.addMessage(userMsg)
     chatStore.resetAgentState()
@@ -2630,6 +2740,104 @@ async function handleSend(
           })
         }
       },
+      onAgentHandoff: (payload: any) => {
+        chatStore.upsertExploringStep({
+          id: `handoff-${payload?.to || 'agent'}`,
+          title: payload?.to ? `移交给 ${payload.to}` : '专家协同',
+          detail: payload?.reason,
+          status: 'done',
+        })
+      },
+      onVisionResult: (payload: any) => {
+        const count = payload?.items?.length || 0
+        chatStore.upsertExploringStep({
+          id: 'vision-result',
+          title: '图片理解完成',
+          detail: count ? `已分析 ${count} 张图片` : '无图片输入',
+          status: 'done',
+        })
+      },
+      onMultimodalRag: (payload: any) => {
+        const textCount = payload?.textSources?.length || 0
+        const imageCount = payload?.imageSources?.length || 0
+        chatStore.upsertExploringStep({
+          id: 'multimodal-rag',
+          title: '图文知识检索',
+          detail: `文本依据 ${textCount} 条，图片候选 ${imageCount} 张`,
+          status: 'done',
+        })
+      },
+      onDeepPlan: (payload: any) => {
+        chatStore.upsertExploringStep({
+          id: 'deep-plan',
+          title: payload?.plan?.title || '深度方案',
+          detail: `规划 ${payload?.plan?.steps?.length || 0} 个专家步骤`,
+          status: 'done',
+        })
+      },
+      onWebResearch: (payload: any) => {
+        chatStore.upsertExploringStep({
+          id: 'web-research-result',
+          title: '外部资料检索',
+          detail: payload?.note || payload?.status || '检索完成',
+          status: payload?.status === 'failed' ? 'error' : 'done',
+        })
+      },
+      onIntentClarification: (payload: any) => {
+        intentClarification.value = {
+          traceId: payload?.traceId,
+          question: payload?.question || '请确认是生成方案，还是进入执行链路。',
+          originalQuestion: payload?.originalQuestion || text,
+          options: payload?.options || [],
+        }
+        chatStore.upsertExploringStep({
+          id: 'intent-clarification',
+          title: '意图澄清',
+          detail: '等待用户选择图文方案或 Plan-Execute 执行',
+          status: 'running',
+        })
+        scrollToBottom()
+      },
+      onImageReview: (payload: any) => {
+        const accepted = payload?.accepted?.length || 0
+        const rejected = payload?.rejectedCount || payload?.rejected?.length || 0
+        chatStore.upsertExploringStep({
+          id: 'image-review',
+          title: '图片审核',
+          detail: payload?.summary || `可用 ${accepted} 张，过滤 ${rejected} 张${payload?.ocrReady ? '，OCR 已就绪' : '，OCR 未配置'}`,
+          status: 'done',
+        })
+      },
+      onImageGeneration: (payload: any) => {
+        chatStore.upsertExploringStep({
+          id: 'image-generation',
+          title: '参考图生成',
+          detail: payload?.note || payload?.message || payload?.status || '已尝试生成参考图',
+          status: payload?.status === 'failed' ? 'error' : 'done',
+        })
+      },
+      onDiagramResult: (payload: any) => {
+        chatStore.upsertExploringStep({
+          id: 'diagram-result',
+          title: '流程图生成',
+          detail: payload?.format === 'drawio' ? 'drawio 流程图已生成' : '使用 Mermaid 流程图兜底',
+          status: 'done',
+        })
+      },
+      onAnswerMedia: (payload: any) => {
+        if (!payload?.id || !payload?.kind || !payload?.status) return
+        chatStore.upsertLastAnswerMedia({
+          id: payload.id,
+          kind: payload.kind,
+          status: payload.status,
+          title: payload.title || (payload.kind === 'diagram' ? '处理流程图' : '参考图片'),
+          url: payload.url,
+          alt: payload.alt,
+          caption: payload.caption,
+          fallback: payload.fallback || payload.message,
+        })
+        scrollToBottom()
+      },
       onTaskProgress: (payload: any) => {
         if (payload?.stageLabel) {
           chatStore.upsertExploringStep({
@@ -2644,8 +2852,8 @@ async function handleSend(
         if (cards.cards) {
           chatStore.setStateCards(cards.cards)
         }
-        if (cards.risk_color) {
-          chatStore.setRiskColor(cards.risk_color)
+        if (cards.riskColor || cards.risk_color) {
+          chatStore.setRiskColor(cards.riskColor || cards.risk_color)
         }
       },
       onError: (err: any) => {
@@ -2876,6 +3084,9 @@ async function handleSend(
     pendingData?.pendingExecutionId,
     selectedServerId.value,
     pendingData?.confirmPlanId,
+    isResume ? 'fast' : selectedThinkingMode.value,
+    isResume ? [] : uploadAttachments,
+    pendingData?.deepIntentChoice,
   )
 }
 
@@ -3211,6 +3422,205 @@ function handleQuickAction(action: string) {
   handleSend(action)
 }
 
+async function copyAssistantContent(content: string) {
+  try {
+    await navigator.clipboard.writeText(content || '')
+    ElMessage.success('已复制回答')
+  } catch {
+    ElMessage.warning('复制失败，请手动选择文本复制')
+  }
+}
+
+function regenerateLastQuestion() {
+  const msg = [...chatStore.messages].reverse().find(m => m.role === 'user')
+  if (!msg?.content) {
+    ElMessage.warning('未找到可重新生成的问题')
+    return
+  }
+  selectedThinkingMode.value = selectedThinkingMode.value || 'deep'
+  handleSend(msg.content, ((msg.attachments || []) as ChatAttachment[]).filter(a => !!a.dataUrl))
+}
+
+function speechStateForContent(content: string): 'idle' | 'generating' | 'playing' | 'paused' {
+  if (!content || activeSpeechContent.value !== content) return 'idle'
+  return speechState.value
+}
+
+function speechErrorForContent(content: string): string {
+  if (!content || activeSpeechContent.value !== content) return ''
+  return speechError.value
+}
+
+function resetSpeechState(clearContent = true) {
+  speechState.value = 'idle'
+  speechUtterance.value = null
+  speechChunks.value = []
+  speechChunkIndex.value = 0
+  if (clearContent) activeSpeechContent.value = ''
+}
+
+function stopSpeech() {
+  speechExpectedCancellation.value = true
+  if (speechAudio.value) {
+    speechAudio.value.pause()
+    speechAudio.value.currentTime = 0
+    speechAudio.value = null
+  }
+  if ('speechSynthesis' in window) {
+    window.speechSynthesis.cancel()
+  }
+  resetSpeechState()
+  window.setTimeout(() => { speechExpectedCancellation.value = false }, 0)
+}
+
+function selectSpeechVoice(): SpeechSynthesisVoice | null {
+  if (speechVoice.value) return speechVoice.value
+  const voices = speechVoices.value.length ? speechVoices.value : window.speechSynthesis.getVoices()
+  speechVoice.value = voices.find(v => /female|xiaoxiao|xiaoyi|huihui|yaoyao|tingting|婷婷|女/i.test(v.name))
+    || voices.find(v => /zh-CN|zh_CN/i.test(v.lang))
+    || voices.find(v => /zh|chinese|mandarin|中文/i.test(v.lang + v.name))
+    || null
+  return speechVoice.value
+}
+
+function playNextBrowserChunk() {
+  if (!('speechSynthesis' in window) || speechState.value === 'paused') return
+  const text = speechChunks.value[speechChunkIndex.value]
+  if (!text) {
+    resetSpeechState()
+    return
+  }
+
+  const utterance = new SpeechSynthesisUtterance(text)
+  speechUtterance.value = utterance
+  utterance.lang = 'zh-CN'
+  utterance.rate = 0.95
+  utterance.pitch = 0.92
+  utterance.volume = 0.9
+  const voice = selectSpeechVoice()
+  if (voice) utterance.voice = voice
+  utterance.onend = () => {
+    if (speechUtterance.value !== utterance || speechState.value === 'paused') return
+    speechChunkIndex.value += 1
+    playNextBrowserChunk()
+  }
+  utterance.onerror = (event: SpeechSynthesisErrorEvent) => {
+    if (speechUtterance.value !== utterance) return
+    const expected = speechExpectedCancellation.value
+      || speechState.value === 'paused'
+      || event.error === 'canceled'
+      || event.error === 'interrupted'
+    if (expected) return
+    speechError.value = `浏览器语音播放失败：${event.error || '未知原因'}`
+    resetSpeechState(false)
+  }
+  speechState.value = 'playing'
+  window.speechSynthesis.speak(utterance)
+}
+
+function speakWithBrowserVoice(content: string, reason?: string) {
+  if (!('speechSynthesis' in window)) {
+    speechError.value = reason || '语音播报不可用：浏览器不支持 speechSynthesis'
+    resetSpeechState(false)
+    return
+  }
+  speechChunks.value = createSpeechChunks(content)
+  speechChunkIndex.value = 0
+  if (!speechChunks.value.length) {
+    speechError.value = '没有可朗读的中文、英文或数字内容。'
+    resetSpeechState(false)
+    return
+  }
+  speechError.value = ''
+  playNextBrowserChunk()
+}
+
+function pauseSpeech() {
+  if (speechState.value !== 'playing') return
+  if (speechAudio.value) speechAudio.value.pause()
+  else if ('speechSynthesis' in window) window.speechSynthesis.pause()
+  speechState.value = 'paused'
+}
+
+async function resumeSpeech() {
+  if (speechState.value !== 'paused') return
+  speechError.value = ''
+  try {
+    if (speechAudio.value) {
+      await speechAudio.value.play()
+    } else if ('speechSynthesis' in window) {
+      if (window.speechSynthesis.paused) window.speechSynthesis.resume()
+      else playNextBrowserChunk()
+    }
+    speechState.value = 'playing'
+  } catch (err: any) {
+    speechError.value = `继续播放失败：${err?.message || '浏览器拒绝播放'}`
+    speechState.value = 'paused'
+  }
+}
+
+async function speakAssistantContent(content: string) {
+  if (!content?.trim()) return
+  if (activeSpeechContent.value === content && speechState.value === 'playing') {
+    pauseSpeech()
+    return
+  }
+  if (activeSpeechContent.value === content && speechState.value === 'paused') {
+    await resumeSpeech()
+    return
+  }
+  stopSpeech()
+  activeSpeechContent.value = content
+  speechState.value = 'generating'
+  speechError.value = ''
+  if (!preferRemoteTts) {
+    speakWithBrowserVoice(content)
+    return
+  }
+  try {
+    const cleanText = createSpeechChunks(content, 900).join(' ')
+    if (!cleanText) throw new Error('没有可朗读的中文、英文或数字内容')
+    const result = await synthesizeSpeech({ text: cleanText, speed: 1.0 })
+    if (result?.status !== 'ok' || !result?.audioUrl) {
+      const reason = result?.message || result?.note || result?.error || 'TTS 服务未配置或未返回音频'
+      speakWithBrowserVoice(content, reason)
+      return
+    }
+    const audio = new Audio(result.audioUrl)
+    speechAudio.value = audio
+    audio.onended = () => resetSpeechState()
+    audio.onerror = () => {
+      speechError.value = '音频加载失败，请检查 TTS 返回地址是否可访问。'
+      resetSpeechState(false)
+    }
+    speechState.value = 'playing'
+    await audio.play()
+  } catch (err: any) {
+    const detail = err?.response?.data?.detail || err?.response?.data?.message || err?.message
+    speakWithBrowserVoice(content, detail || '远端 TTS 调用失败，已切换浏览器语音')
+  }
+}
+
+function latestUserAttachments(): ChatAttachment[] {
+  const msg = [...chatStore.messages].reverse().find(m => m.role === 'user')
+  return ((msg?.attachments || []) as ChatAttachment[]).filter(a => !!a.dataUrl)
+}
+
+function handleIntentClarificationSelect(option: IntentClarificationOption) {
+  const current = intentClarification.value
+  if (!current) return
+  const original = current.originalQuestion || [...chatStore.messages].reverse().find(m => m.role === 'user')?.content || ''
+  intentClarification.value = null
+  chatStore.upsertExploringStep({
+    id: 'intent-clarification',
+    title: '意图澄清',
+    detail: option.title,
+    status: 'done',
+  })
+  selectedThinkingMode.value = 'deep'
+  handleSend(original, latestUserAttachments(), { deepIntentChoice: option.id })
+}
+
 function openTraceTimeline(traceId: string) {
   panelTitle.value = '推理链路 · ' + traceId.slice(0, 16) + '...'
   panelMode.value = 'trace'
@@ -3247,6 +3657,10 @@ onUnmounted(() => {
   stopApprovalPolling()
   stopAwaitingRunPolling()
   stopPlanFallbackPoll()
+  stopSpeech()
+  if ('speechSynthesis' in window) {
+    window.speechSynthesis.onvoiceschanged = null
+  }
   window.removeEventListener('focus', handleWindowFocus)
 })
 
@@ -3322,6 +3736,12 @@ async function restorePendingActions(sessionId: string) {
 
 onMounted(async () => {
   window.addEventListener('focus', handleWindowFocus)
+  if ('speechSynthesis' in window) {
+    speechVoices.value = window.speechSynthesis.getVoices()
+    window.speechSynthesis.onvoiceschanged = () => {
+      speechVoices.value = window.speechSynthesis.getVoices()
+    }
+  }
   await loadServerList()
   await loadSessions()
   if (route.params.id) {
@@ -3487,6 +3907,7 @@ watch(() => route.query.trace, (trace) => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
   padding: 10px 20px;
   border-bottom: 1px solid #e2e8f0;
   background: #fafbfc;
@@ -3494,6 +3915,8 @@ watch(() => route.query.trace, (trace) => {
     display: flex;
     align-items: center;
     gap: 10px;
+    flex-wrap: wrap;
+    min-width: 0;
   }
   .topbar-title {
     font-family: 'JetBrains Mono', monospace;
@@ -3546,6 +3969,41 @@ watch(() => route.query.trace, (trace) => {
     &.online { background: #10b981; }
     &.offline { background: #ef4444; }
     &.unknown { background: #cbd5e1; }
+  }
+}
+
+.thinking-mode-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: 8px;
+  padding: 3px;
+  border: 1px solid #dbeafe;
+  border-radius: 8px;
+  background: #fff;
+  flex-shrink: 0;
+
+  button {
+    min-width: 72px;
+    height: 28px;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: #64748b;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.15s;
+
+    &.active {
+      background: #2563eb;
+      color: #fff;
+      box-shadow: 0 1px 5px rgba(37, 99, 235, 0.18);
+    }
+
+    &:hover:not(.active) {
+      background: #eff6ff;
+      color: #2563eb;
+    }
   }
 }
 
@@ -3635,7 +4093,10 @@ watch(() => route.query.trace, (trace) => {
 
 .msg-wrapper {
   position: relative;
-  border-radius: 12px;
+  width: min(100%, 1120px);
+  margin-right: auto;
+  margin-left: auto;
+  border-radius: 8px;
   transition: box-shadow 0.25s ease, background 0.25s ease;
   &:hover .msg-delete-btn { opacity: 1; }
   &.trace-highlight {
@@ -3843,6 +4304,88 @@ watch(() => route.query.trace, (trace) => {
 .action-dock {
   margin-top: 8px;
   margin-bottom: 12px;
+
+  .intent-clarification-card {
+    background: #fff;
+    border: 1px solid #d7e3f5;
+    border-radius: 8px;
+    padding: 14px 16px;
+    box-shadow: 0 2px 10px rgba(15, 23, 42, 0.06);
+  }
+
+  .intent-clarification-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    color: #172554;
+    font-size: 14px;
+    margin-bottom: 8px;
+  }
+
+  .intent-clarification-badge {
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: #e0f2fe;
+    color: #0369a1;
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .intent-clarification-question {
+    margin: 0 0 12px;
+    color: #475569;
+    line-height: 1.6;
+    font-size: 13px;
+  }
+
+  .intent-clarification-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+
+  .intent-choice-btn {
+    text-align: left;
+    border: 1px solid #dbe3ef;
+    background: #f8fafc;
+    color: #334155;
+    border-radius: 8px;
+    padding: 10px 12px;
+    cursor: pointer;
+    transition: border-color 0.16s ease, background 0.16s ease, transform 0.16s ease;
+
+    span {
+      display: block;
+      font-size: 14px;
+      font-weight: 700;
+      color: #1e293b;
+      margin-bottom: 4px;
+    }
+
+    small {
+      display: block;
+      font-size: 12px;
+      line-height: 1.45;
+      color: #64748b;
+    }
+
+    &:hover {
+      border-color: #60a5fa;
+      background: #eff6ff;
+      transform: translateY(-1px);
+    }
+
+    &.primary {
+      border-color: #bfdbfe;
+      background: #eff6ff;
+    }
+  }
+
+  @media (max-width: 720px) {
+    .intent-clarification-actions {
+      grid-template-columns: 1fr;
+    }
+  }
 
   .approval-bar-inner {
     background: #fff;

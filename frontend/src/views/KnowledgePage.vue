@@ -744,7 +744,7 @@ function getKeyPoints(a: any): string[] {
   }
 
   if (points.length === 0) {
-    const lines = content.split('\n').map(l => l.trim()).filter(Boolean)
+    const lines = content.split('\n').map((l: string) => l.trim()).filter(Boolean)
     for (const line of lines) {
       if (/^#{1,3}\s/.test(line) || line.startsWith('|') || /^分类[：:]/.test(line)) continue
       const cleaned = cleanKeyPointText(line)

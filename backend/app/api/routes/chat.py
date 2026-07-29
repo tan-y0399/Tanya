@@ -136,6 +136,23 @@ async def get_checkpoint(checkpoint_id: str,
     return {"code": 0, "data": data}
 
 
+@router.post("/tts")
+async def text_to_speech(req: dict = Body(...),
+                         user: dict = Depends(get_current_user)):
+    """Generate speech audio for an assistant answer."""
+    from app.services.multimodal_assets import synthesize_tts
+
+    text = (req.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text 不能为空")
+    data = await synthesize_tts(
+        text,
+        voice=(req.get("voice") or getattr(settings, "tts_voice", "Cherry")),
+        speed=float(req.get("speed") or 1.0),
+    )
+    return {"code": 0, "data": data}
+
+
 @router.post("/sessions/{session_id}/checkpoints")
 async def save_checkpoint(session_id: str, req: dict = Body(...),
                           user: dict = Depends(get_current_user),
@@ -227,10 +244,16 @@ async def send_message(req: dict = Body(...),
 
     session_id = req.get("sessionId", "")
     content = req.get("content", "") or ""
+    thinking_mode = (req.get("thinkingMode") or "fast").strip().lower()
+    attachments = req.get("attachments") or []
+    deep_intent_choice = (req.get("deepIntentChoice") or "").strip()
     pending_approval_id = req.get("pendingApprovalId", "")
     pending_execution_id = req.get("pendingExecutionId", "")
     confirm_plan_id = req.get("confirmPlanId", "")
     server_id = req.get("serverId", "")
+
+    if attachments and not content.strip():
+        content = "请分析我上传的图片"
 
     if not pending_approval_id and not pending_execution_id and not confirm_plan_id:
         pre = validate_user_input(content)
@@ -248,6 +271,22 @@ async def send_message(req: dict = Body(...),
                 ):
                     yield f"event: {event['event']}\ndata: {event['data']}\n\n"
             else:
+                if (
+                    getattr(settings, "enable_multimodal_agent", True)
+                    and thinking_mode == "deep"
+                    and not confirm_plan_id
+                ):
+                    from app.services.multimodal_agent.service import process_multimodal_message
+                    async for event in process_multimodal_message(
+                        db, session_id, content, user["id"],
+                        user_role=user.get("role", "user"),
+                        server_id=server_id or None,
+                        attachments=attachments,
+                        intent_choice=deep_intent_choice or None,
+                    ):
+                        yield f"event: {event['event']}\ndata: {event['data']}\n\n"
+                    return
+
                 if getattr(settings, "use_langgraph_orchestrator", False):
                     from app.services.chat_orchestrator import process_chat_message
                     stream_fn = process_chat_message
@@ -281,4 +320,3 @@ async def send_message(req: dict = Body(...),
             "X-Accel-Buffering": "no",
         },
     )
-

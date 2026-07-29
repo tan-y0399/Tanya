@@ -274,7 +274,7 @@ async function loadTitles() {
   loading.value = true
   try {
     const data = await fetchArticles({ page: 1, size: 250 })
-    const titles = (data.items || [])
+    const titles = ((data.items || []) as Array<{ title?: string }>)
       .map((a: { title?: string }) => (a.title || '').trim())
       .filter((t: string) => t.length >= 4 && t.length <= 48)
     titlePool = [...new Set(titles)]

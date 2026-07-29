@@ -1,6 +1,34 @@
 <template>
   <div class="chat-input-area">
+    <div v-if="attachments.length" class="attachment-strip">
+      <div v-for="att in attachments" :key="att.id" class="attachment-chip">
+        <img :src="att.dataUrl" :alt="att.name" />
+        <span>{{ att.name }}</span>
+        <button type="button" @click="removeAttachment(att.id)" title="移除图片">×</button>
+      </div>
+    </div>
     <div class="input-wrapper" :class="{ 'input-wrapper--multiline': isMultiline }">
+      <input
+        ref="fileInputRef"
+        class="file-input"
+        type="file"
+        accept="image/png,image/jpeg,image/webp,image/gif"
+        multiple
+        @change="handleFiles"
+      />
+      <button
+        type="button"
+        class="attach-btn"
+        :disabled="isStreaming"
+        title="上传图片"
+        @click="fileInputRef?.click()"
+      >
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+          <path d="M5 12.5l2.4-2.7 1.8 1.9 2.2-2.7 2.6 3.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+          <rect x="2.5" y="3" width="13" height="12" rx="2" stroke="currentColor" stroke-width="1.4"/>
+          <circle cx="6.5" cy="6.7" r="1.2" fill="currentColor"/>
+        </svg>
+      </button>
       <textarea
         ref="inputRef"
         v-model="inputText"
@@ -18,8 +46,8 @@
       </button>
       <button v-else
         class="send-btn"
-        :class="{ active: inputText.trim(), disabled: !inputText.trim() }"
-        :disabled="!inputText.trim()"
+        :class="{ active: canSend, disabled: !canSend }"
+        :disabled="!canSend"
         @click="send"
       >
         <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
@@ -30,23 +58,27 @@
     <div class="input-hint">
       <span>Enter 发送</span>
       <span class="hint-sep">·</span>
-      <span>基于 ReAct / Plan-Execute 智能编排</span>
+      <span>支持文字与图片，深度思考将启用多模态专家链路</span>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, nextTick, onMounted } from 'vue'
+import { computed, ref, nextTick, onMounted } from 'vue'
+import type { ChatAttachment } from '@/stores/chat'
 
 defineProps<{ isStreaming: boolean }>()
 const emit = defineEmits<{
-  send: [text: string]
+  send: [text: string, attachments: ChatAttachment[]]
   stop: []
 }>()
 
 const inputRef = ref<HTMLTextAreaElement>()
+const fileInputRef = ref<HTMLInputElement>()
 const inputText = ref('')
 const isMultiline = ref(false)
+const attachments = ref<ChatAttachment[]>([])
+const canSend = computed(() => !!inputText.value.trim() || attachments.value.length > 0)
 
 const INPUT_MIN_HEIGHT = 24
 const INPUT_MAX_HEIGHT = 120
@@ -64,9 +96,11 @@ function autoResize() {
 
 function send() {
   const text = inputText.value.trim()
-  if (!text) return
-  emit('send', text)
+  if (!canSend.value) return
+  emit('send', text, attachments.value)
   inputText.value = ''
+  attachments.value = []
+  if (fileInputRef.value) fileInputRef.value.value = ''
   nextTick(autoResize)
 }
 
@@ -75,6 +109,31 @@ function stop() {
 }
 
 onMounted(autoResize)
+
+function removeAttachment(id?: string) {
+  attachments.value = attachments.value.filter(a => a.id !== id)
+}
+
+function handleFiles(event: Event) {
+  const input = event.target as HTMLInputElement
+  const files = Array.from(input.files || [])
+  for (const file of files.slice(0, 4 - attachments.value.length)) {
+    if (!file.type.startsWith('image/')) continue
+    if (file.size > 8 * 1024 * 1024) continue
+    const reader = new FileReader()
+    reader.onload = () => {
+      attachments.value.push({
+        id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+        kind: 'image',
+        name: file.name,
+        contentType: file.type,
+        size: file.size,
+        dataUrl: String(reader.result || ''),
+      })
+    }
+    reader.readAsDataURL(file)
+  }
+}
 </script>
 
 <style lang="scss" scoped>
@@ -102,6 +161,75 @@ onMounted(autoResize)
   &--multiline {
     align-items: flex-end;
     padding-bottom: 8px;
+  }
+}
+
+.attachment-strip {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.attachment-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 220px;
+  padding: 6px 8px;
+  border: 1px solid #dbeafe;
+  border-radius: 8px;
+  background: #eff6ff;
+  color: #475569;
+  font-size: 12px;
+
+  img {
+    width: 34px;
+    height: 34px;
+    border-radius: 6px;
+    object-fit: cover;
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  button {
+    width: 20px;
+    height: 20px;
+    border: none;
+    border-radius: 5px;
+    background: #dbeafe;
+    color: #2563eb;
+    cursor: pointer;
+  }
+}
+
+.file-input {
+  display: none;
+}
+
+.attach-btn {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  border: 1px solid #e2e8f0;
+  background: #fff;
+  color: #64748b;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+  flex-shrink: 0;
+
+  &:hover:not(:disabled) {
+    color: #2563eb;
+    border-color: #bfdbfe;
+    background: #eff6ff;
   }
 }
 

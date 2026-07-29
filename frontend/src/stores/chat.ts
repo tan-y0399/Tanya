@@ -10,9 +10,33 @@ export interface Message {
   id: string
   role: 'user' | 'assistant' | 'tool_call' | 'system'
   content: string
+  attachments?: ChatAttachment[]
   toolCalls?: ToolCall[]
   traceId?: string
   createdAt: string
+  answerMedia?: AnswerMedia[]
+}
+
+export interface AnswerMedia {
+  id: string
+  kind: 'image' | 'diagram'
+  status: 'pending' | 'ready' | 'failed'
+  title: string
+  url?: string
+  alt?: string
+  caption?: string
+  fallback?: string
+}
+
+export interface ChatAttachment {
+  id?: string
+  kind?: 'image'
+  name: string
+  contentType?: string
+  size?: number
+  url?: string
+  dataUrl?: string
+  meta?: Record<string, any>
 }
 
 export interface ToolCall {
@@ -111,6 +135,15 @@ export const useChatStore = defineStore('chat', () => {
   function appendToLastMessage(token: string) {
     const m = findLastAssistantMessage()
     if (m) m.content += token
+  }
+
+  function upsertLastAnswerMedia(media: AnswerMedia) {
+    const message = findLastAssistantMessage()
+    if (!message) return
+    const list = message.answerMedia || (message.answerMedia = [])
+    const index = list.findIndex(item => item.id === media.id)
+    if (index >= 0) list[index] = { ...list[index], ...media }
+    else list.push(media)
   }
 
   /** 总结阶段流式写入：替换轻量模板结论，保留运维报告附录 */
@@ -231,7 +264,7 @@ export const useChatStore = defineStore('chat', () => {
 
   return {
     sessions, currentSessionId, messages, isStreaming, currentTraceId,
-    setSessions, setCurrentSession, setMessages, addMessage, appendToLastMessage,
+    setSessions, setCurrentSession, setMessages, addMessage, appendToLastMessage, upsertLastAnswerMedia,
     appendSummaryToken, prepareSummaryStream,
     setStreaming, setCurrentTraceId,
     currentIntent, intentLabel, intentConfidence, responsePhase, responsePhaseMessage,

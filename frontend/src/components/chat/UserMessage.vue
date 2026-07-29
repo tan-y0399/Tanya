@@ -5,7 +5,16 @@
         <span class="msg-time">{{ formattedTime }}</span>
         <span class="msg-role">我</span>
       </div>
-      <div class="msg-content">{{ content }}</div>
+      <div v-if="attachments?.length" class="msg-attachments">
+        <img
+          v-for="att in attachments"
+          :key="att.id || att.url || att.name"
+          :src="att.url || att.dataUrl"
+          :alt="att.name"
+          class="msg-image"
+        />
+      </div>
+      <div v-if="content" class="msg-content">{{ content }}</div>
     </div>
     <div class="msg-avatar">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
@@ -18,10 +27,12 @@
 
 <script setup lang="ts">
 import { formatTime } from '@/utils'
+import type { ChatAttachment } from '@/stores/chat'
 
 const props = defineProps<{
   content: string
   createdAt: string
+  attachments?: ChatAttachment[]
 }>()
 
 const formattedTime = formatTime(props.createdAt)
@@ -79,6 +90,23 @@ const formattedTime = formatTime(props.createdAt)
   border-radius: 14px 4px 14px 14px;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.msg-attachments {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 180px));
+  gap: 8px;
+  justify-content: end;
+  margin-bottom: 8px;
+}
+
+.msg-image {
+  width: 100%;
+  max-height: 180px;
+  object-fit: cover;
+  border-radius: 10px;
+  border: 1px solid rgba(191, 219, 254, 0.9);
+  background: #eff6ff;
 }
 
 @keyframes fadeIn {

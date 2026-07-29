@@ -143,6 +143,13 @@ import { computed, ref, watch } from 'vue'
 import AuditIcon from './AuditIcon.vue'
 import { MODULE_TABS, type AuditStats } from './auditEventMeta'
 
+type ModuleTab = {
+  key: string
+  label: string
+  icon: string
+  statKey?: string
+}
+
 const props = defineProps<{
   activeTab: string
   keyword: string
@@ -195,12 +202,12 @@ const activeFilterTags = computed(() => {
   return tags
 })
 
-function tabStat(tab: (typeof MODULE_TABS)[number]) {
-  if (!tab.key || !props.stats) return 0
-  const key = 'statKey' in tab ? tab.statKey : tab.key
+function tabStat(tab: ModuleTab) {
+  if (!props.stats) return 0
   if (tab.key === '') return props.stats.total
+  const key = tab.statKey || tab.key
   if (key === 'blocked_injection') return props.stats.byEventType?.blocked_injection ?? 0
-  return props.stats.byEventType?.[key as string] ?? 0
+  return props.stats.byEventType?.[key] ?? 0
 }
 
 function onPanelFocusOut(e: FocusEvent) {

@@ -46,7 +46,7 @@
             <div class="detail-label">状态</div>
             <div class="detail-value">
               <span class="status-chip" :class="toolDetail.status">
-                {{ {executing:'执行中',completed:'已完成',rejected:'已拒绝',timeout:'超时',blocked:'已阻止',pending_approval:'待审批',pending_confirm:'待确认'}[toolDetail.status] }}
+                {{ TOOL_STATUS_LABELS[toolDetail.status] || toolDetail.status }}
               </span>
             </div>
           </div>
@@ -155,6 +155,17 @@
 <script setup lang="ts">
 import { ref, watch, computed } from 'vue'
 import type { ToolCall } from '@/stores/chat'
+
+const TOOL_STATUS_LABELS: Record<string, string> = {
+  executing: '执行中',
+  completed: '已完成',
+  failed: '执行失败',
+  rejected: '已拒绝',
+  timeout: '超时',
+  blocked: '已阻止',
+  pending_approval: '待审批',
+  pending_confirm: '待确认',
+}
 
 const props = defineProps<{
   visible: boolean
