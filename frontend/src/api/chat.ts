@@ -120,6 +120,7 @@ export interface SendMessageCallbacks {
   onVisionResult?: (payload: any) => void
   onMultimodalRag?: (payload: any) => void
   onAgentHandoff?: (payload: any) => void
+  onDeepIntentResolved?: (payload: any) => void
   onDeepPlan?: (payload: any) => void
   onWebResearch?: (payload: any) => void
   onIntentClarification?: (payload: any) => void
@@ -168,6 +169,14 @@ function dispatchSseEvent(eventName: string, payload: any, cbs: SendMessageCallb
     case 'vision_result': cbs.onVisionResult?.(payload); break
     case 'multimodal_rag': cbs.onMultimodalRag?.(payload); break
     case 'agent_handoff': cbs.onAgentHandoff?.(payload); break
+    case 'deep_intent_resolved':
+      cbs.onDeepIntentResolved?.(payload)
+      cbs.onIntentResolved?.({
+        intent: payload?.intent,
+        label: payload?.label,
+        confidence: payload?.confidence,
+      })
+      break
     case 'deep_plan': cbs.onDeepPlan?.(payload); break
     case 'web_research': cbs.onWebResearch?.(payload); break
     case 'intent_clarification': cbs.onIntentClarification?.(payload); break

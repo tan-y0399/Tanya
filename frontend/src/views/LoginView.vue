@@ -65,7 +65,7 @@
           />
         </div>
         <div class="hint">
-          {{ activeRole === 'admin' ? '默认管理员 admin / admin123' : '默认用户 lk / lk666' }}
+          {{ activeRole === 'admin' ? '默认管理员 admin / admin123' : '默认用户 ty / ty666' }}
         </div>
         <button class="login-btn" :disabled="loading" @click="handleLogin">
           {{ loading ? '验证中...' : activeRoleLabel }}

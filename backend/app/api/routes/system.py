@@ -103,7 +103,9 @@ async def get_config(user: dict = Depends(get_current_user)):
         "data": {
             "llm": {
                 "model": settings.llm_model, "apiBase": settings.llm_api_base,
-                "apiKey": settings.llm_api_key,
+                # 不回传明文，仅告知是否已配置；更换时由前端提交新值
+                "apiKey": "",
+                "apiKeySet": bool(settings.llm_api_key and str(settings.llm_api_key).strip()),
                 "temperature": settings.llm_temperature, "maxTokens": settings.llm_max_tokens,
                 "systemRoleSupport": settings.llm_system_role_support,
             },
@@ -156,6 +158,11 @@ async def update_config(payload: dict = Body(...), user: dict = Depends(get_curr
     }
     if payload.get("llm"):
         for k, v in payload["llm"].items():
+            # apiKey 留空表示不修改已保存的值
+            if k == "apiKey" and (v is None or str(v).strip() == ""):
+                continue
+            if k == "apiKeySet":
+                continue
             env_key = llm_map.get(k)
             if env_key:
                 env_updates[env_key] = str(v)

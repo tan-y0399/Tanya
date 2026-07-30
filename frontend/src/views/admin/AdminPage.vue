@@ -642,7 +642,10 @@ const PRESET_TOOLS = [
 ]
 
 // ========== 安全配置 ==========
-const config = reactive({ llm: { apiBase: '', model: '', apiKey: '', temperature: 0.1, maxTokens: 4096 }, security: { approvalTimeout: 60, maxRounds: 20 } })
+const config = reactive({
+  llm: { apiBase: '', model: '', apiKey: '', apiKeySet: false, temperature: 0.1, maxTokens: 4096 },
+  security: { approvalTimeout: 60, maxRounds: 20 },
+})
 const savingConfig = ref(false)
 
 // ========== 知识库 ==========
@@ -776,8 +779,21 @@ async function loadTools() {
 async function loadConfig() {
   try {
     const data = await getConfig()
-    if (data?.llm) Object.assign(config.llm, data.llm)
-    if (data?.security) Object.assign(config.security, data.security)
+    if (data?.llm) {
+      config.llm.apiBase = data.llm.apiBase ?? config.llm.apiBase
+      config.llm.model = data.llm.model ?? config.llm.model
+      config.llm.temperature = data.llm.temperature ?? config.llm.temperature
+      config.llm.maxTokens = data.llm.maxTokens ?? config.llm.maxTokens
+      config.llm.apiKeySet = Boolean(data.llm.apiKeySet)
+      config.llm.apiKey = ''
+    }
+    if (data?.security) {
+      config.security.approvalTimeout = data.security.approvalTimeout ?? config.security.approvalTimeout
+      config.security.maxRounds =
+        data.security.maxConversationRounds
+        ?? data.security.maxRounds
+        ?? config.security.maxRounds
+    }
   } catch {}
 }
 async function loadArticles() {
@@ -924,9 +940,33 @@ async function importPresetTools() {
 
 async function saveConfig() {
   savingConfig.value = true
-  try { await updateConfig({ llm: config.llm, security: config.security }); ElMessage.success('配置已保存') }
-  catch { ElMessage.error('保存失败') }
-  finally { savingConfig.value = false }
+  try {
+    const llm: Record<string, unknown> = {
+      apiBase: config.llm.apiBase,
+      model: config.llm.model,
+      temperature: config.llm.temperature,
+      maxTokens: config.llm.maxTokens,
+    }
+    const nextKey = config.llm.apiKey.trim()
+    if (nextKey) llm.apiKey = nextKey
+
+    await updateConfig({
+      llm,
+      security: {
+        approvalTimeout: config.security.approvalTimeout,
+        maxConversationRounds: config.security.maxRounds,
+      },
+    })
+    if (nextKey) {
+      config.llm.apiKeySet = true
+      config.llm.apiKey = ''
+    }
+    ElMessage.success('配置已保存')
+  } catch {
+    ElMessage.error('保存失败')
+  } finally {
+    savingConfig.value = false
+  }
 }
 
 function handleArticleAction(cmd: string, row: any) {

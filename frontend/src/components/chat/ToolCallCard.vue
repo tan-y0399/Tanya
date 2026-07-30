@@ -123,6 +123,13 @@
 
         <!-- 命令输出表格化展示 -->
         <div v-else-if="isRunCommand && hasStdout && !preferPlainOutput && parsedTable" class="cmd-output-wrap">
+          <div class="output-toolbar" v-if="showOutputToggle">
+            <span class="output-hint">{{ outputWindowHint }}</span>
+            <button type="button" class="output-toggle" @click="outputExpanded = !outputExpanded">
+              {{ outputExpanded ? '收起' : '展开全部' }}
+            </button>
+          </div>
+          <div class="output-window" :class="{ expanded: outputExpanded }">
           <div v-if="parsedTable.type === 'table'" class="cmd-table-container">
             <table class="pretty-table">
               <thead>
@@ -133,31 +140,50 @@
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="(row, rIdx) in parsedTable.rows" :key="rIdx" class="data-row">
+                <tr v-for="(row, rIdx) in visibleTableRows" :key="rIdx" class="data-row">
                   <td v-for="(cell, cIdx) in row" :key="cIdx" class="data-cell">{{ cell }}</td>
                 </tr>
               </tbody>
             </table>
           </div>
           <div v-else-if="parsedTable.type === 'list'" class="cmd-list-container">
-            <div v-for="(item, idx) in parsedTable.items" :key="idx" class="list-card">
+            <div v-for="(item, idx) in visibleListItems" :key="idx" class="list-card">
               <span class="list-index">{{ idx + 1 }}</span>
               <span class="list-content">{{ item }}</span>
             </div>
           </div>
-          <pre v-else class="tc-code">{{ tool.result.data.stdout }}</pre>
+          <pre v-else class="tc-code">{{ visibleStdout }}</pre>
+          </div>
         </div>
 
         <!-- 命令 KV / 纯文本输出 -->
         <div v-else-if="isRunCommand && hasStdout" class="cmd-output-wrap">
-          <div v-if="displaySummary" class="summary-block">{{ displaySummary }}</div>
+          <div v-if="displaySummary" class="output-toolbar">
+            <span class="output-hint">{{ summaryWindowHint }}</span>
+            <button v-if="summaryNeedsToggle" type="button" class="output-toggle" @click="outputExpanded = !outputExpanded">
+              {{ outputExpanded ? '收起' : '展开全部' }}
+            </button>
+          </div>
+          <div v-if="displaySummary" class="output-window" :class="{ expanded: outputExpanded }">
+            <div class="summary-block">{{ visibleSummary }}</div>
+          </div>
           <div v-if="parsedKvRows.length" class="kv-grid">
             <div v-for="row in parsedKvRows" :key="row.key" class="kv-row">
               <span class="kv-k">{{ row.key }}</span>
               <span class="kv-v">{{ row.value }}</span>
             </div>
           </div>
-          <pre v-else class="tc-code">{{ tool.result.data.stdout }}</pre>
+          <template v-else>
+            <div class="output-toolbar" v-if="showOutputToggle">
+              <span class="output-hint">{{ outputWindowHint }}</span>
+              <button type="button" class="output-toggle" @click="outputExpanded = !outputExpanded">
+                {{ outputExpanded ? '收起' : '展开全部' }}
+              </button>
+            </div>
+            <div class="output-window" :class="{ expanded: outputExpanded }">
+              <pre class="tc-code">{{ visibleStdout }}</pre>
+            </div>
+          </template>
         </div>
 
         <!-- 进程列表 -->
@@ -167,10 +193,30 @@
         </div>
 
         <!-- 网络/日志等纯文本 -->
-        <pre v-else-if="hasRaw" class="tc-code">{{ tool.result.data.raw }}</pre>
+        <div v-else-if="hasRaw" class="cmd-output-wrap">
+          <div class="output-toolbar" v-if="showOutputToggle">
+            <span class="output-hint">{{ outputWindowHint }}</span>
+            <button type="button" class="output-toggle" @click="outputExpanded = !outputExpanded">
+              {{ outputExpanded ? '收起' : '展开全部' }}
+            </button>
+          </div>
+          <div class="output-window" :class="{ expanded: outputExpanded }">
+            <pre class="tc-code">{{ visibleRaw }}</pre>
+          </div>
+        </div>
 
         <!-- 展示摘要（无专用模板时） -->
-        <div v-else-if="displaySummary" class="summary-block">{{ displaySummary }}</div>
+        <div v-else-if="displaySummary" class="cmd-output-wrap">
+          <div class="output-toolbar">
+            <span class="output-hint">{{ summaryWindowHint }}</span>
+            <button v-if="summaryNeedsToggle" type="button" class="output-toggle" @click="outputExpanded = !outputExpanded">
+              {{ outputExpanded ? '收起' : '展开全部' }}
+            </button>
+          </div>
+          <div class="output-window" :class="{ expanded: outputExpanded }">
+            <div class="summary-block">{{ visibleSummary }}</div>
+          </div>
+        </div>
 
         <!-- 通用 JSON -->
         <pre v-else class="tc-code">{{ formatJson(tool.result.data) }}</pre>
@@ -200,7 +246,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import type { ToolCall } from '@/stores/chat'
 import { toolDisplayName, toolActionHint } from '@/utils/toolDisplay'
 import RollbackButton from '@/components/chat/RollbackButton.vue'
@@ -216,6 +262,13 @@ defineEmits<{ viewDetail: [tool: ToolCall]; rollback: [tool: ToolCall] }>()
 
 const WRITE_TOOLS = new Set(['execute_command', 'run_command', 'manage_service', 'kill_process'])
 const ROLLBACK_RISKS = new Set(['L2', 'L3', 'L4'])
+const LOG_TOOL_NAMES = new Set(['get_logs', 'read_log_file', 'search_journal_logs'])
+const COLLAPSED_TABLE_ROWS = 8
+const COLLAPSED_LIST_ITEMS = 10
+const COLLAPSED_TEXT_LINES = 8
+const LONG_TEXT_THRESHOLD = 900
+
+const outputExpanded = ref(false)
 
 const showRollback = computed(() => {
   if (props.tool.status !== 'completed' || props.rolledBack || props.tool.result?.success === false) {
@@ -344,12 +397,79 @@ const isRunCommand = computed(() => props.tool.toolName === 'execute_command' ||
 const executedCommand = computed(() =>
   String(props.tool.params?.command || props.tool.params?.cmd || '').toLowerCase(),
 )
+const isLogLikeOutput = computed(() => {
+  if (LOG_TOOL_NAMES.has(props.tool.toolName || '')) return true
+  const cmd = executedCommand.value
+  if (/\b(journalctl|dmesg|tail|less)\b|\/var\/log|\.log\b/.test(cmd)) return true
+
+  const source = [stdoutText.value, rawText.value, displaySummary.value].filter(Boolean).join('\n')
+  const lines = source.split('\n').filter(Boolean).slice(0, 20)
+  if (lines.length < 3) return false
+  const logLineCount = lines.filter(line =>
+    /^[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+/.test(line)
+    || /^\d{1,2}\s*月\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+/.test(line)
+    || /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}/.test(line)
+    || /\b(systemd|kernel|audit|dbus|gnome-session|lightdm|sshd|localhost\.localdomain)\b/i.test(line),
+  ).length
+  return logLineCount >= Math.max(3, Math.floor(lines.length * 0.5))
+})
 const preferPlainOutput = computed(() =>
-  isRunCommand.value && /^(chronyc|timedatectl|date)\b/.test(executedCommand.value),
+  isLogLikeOutput.value || (isRunCommand.value && /^(chronyc|timedatectl|date)\b/.test(executedCommand.value)),
 )
+
+const stdoutText = computed(() => String((data.value as any)?.stdout || ''))
+const rawText = computed(() => String((data.value as any)?.raw || ''))
+const activeText = computed(() => hasStdout.value ? stdoutText.value : rawText.value)
+const activeTextLines = computed(() => activeText.value.split('\n'))
+
+const visibleStdout = computed(() => compactText(stdoutText.value))
+const visibleRaw = computed(() => compactText(rawText.value))
+
+const visibleTableRows = computed(() => {
+  const table = parsedTable.value
+  if (!table || table.type !== 'table') return []
+  const rows = Array.isArray(table.rows) ? table.rows : []
+  return outputExpanded.value ? rows : rows.slice(0, COLLAPSED_TABLE_ROWS)
+})
+
+const visibleListItems = computed(() => {
+  const table = parsedTable.value
+  if (!table || table.type !== 'list') return []
+  const items = Array.isArray(table.items) ? table.items : []
+  return outputExpanded.value ? items : items.slice(0, COLLAPSED_LIST_ITEMS)
+})
+
+const showOutputToggle = computed(() => {
+  const table = parsedTable.value
+  if (summaryNeedsToggle.value) return true
+  if (table?.type === 'table') return (table.rows?.length || 0) > COLLAPSED_TABLE_ROWS
+  if (table?.type === 'list') return (table.items?.length || 0) > COLLAPSED_LIST_ITEMS
+  return activeTextLines.value.length > COLLAPSED_TEXT_LINES || activeText.value.length > LONG_TEXT_THRESHOLD
+})
+
+const outputWindowHint = computed(() => {
+  const table = parsedTable.value
+  if (table?.type === 'table') {
+    const rowCount = table.rows?.length || 0
+    return outputExpanded.value
+      ? `已展开全部 ${rowCount} 行`
+      : `仅显示前 ${Math.min(COLLAPSED_TABLE_ROWS, rowCount)} 行，共 ${rowCount} 行`
+  }
+  if (table?.type === 'list') {
+    const itemCount = table.items?.length || 0
+    return outputExpanded.value
+      ? `已展开全部 ${itemCount} 条`
+      : `仅显示前 ${Math.min(COLLAPSED_LIST_ITEMS, itemCount)} 条，共 ${itemCount} 条`
+  }
+  const total = activeTextLines.value.length
+  return outputExpanded.value
+    ? `已展开全部 ${total} 行`
+    : `仅显示前 ${Math.min(COLLAPSED_TEXT_LINES, total)} 行，共 ${total} 行`
+})
 
 const parsedKvRows = computed(() => {
   if (!hasStdout.value) return []
+  if (preferPlainOutput.value || isLogLikeOutput.value) return []
   const stdout = String((data.value as any)?.stdout || '')
   if (!stdout.includes(':')) return []
   const rows: { key: string; value: string }[] = []
@@ -371,6 +491,18 @@ const displaySummary = computed(() =>
   || (data.value as any)?.summary
   || ''
 )
+const summaryText = computed(() => String(displaySummary.value || ''))
+const summaryNeedsToggle = computed(() =>
+  summaryText.value.split('\n').length > COLLAPSED_TEXT_LINES
+  || summaryText.value.length > LONG_TEXT_THRESHOLD,
+)
+const visibleSummary = computed(() => compactText(summaryText.value))
+const summaryWindowHint = computed(() => {
+  const total = summaryText.value.split('\n').length
+  return outputExpanded.value
+    ? `已展开全部 ${total} 行摘要`
+    : `仅显示前 ${Math.min(COLLAPSED_TEXT_LINES, total)} 行摘要`
+})
 
 const serviceActive = computed(() => !!(data.value as any)?.active)
 const serviceSummary = computed(() => displaySummary.value || (serviceActive.value ? '服务运行中' : '服务未运行'))
@@ -414,6 +546,7 @@ const procCount = computed(() => {
 // 智能解析命令输出为表格
 const parsedTable = computed(() => {
   if (!hasStdout.value) return null
+  if (preferPlainOutput.value) return null
   const stdout = (data.value as any).stdout as string
   const lines = stdout.split('\n').filter(Boolean)
   
@@ -572,6 +705,19 @@ function parseColumnsByMultiSpace(line: string): string[] {
 // 按单个空格分割列
 function parseColumnsBySingleSpace(line: string): string[] {
   return line.trim().split(/\s+/).filter(Boolean)
+}
+
+function compactText(text: string): string {
+  if (outputExpanded.value) return text
+  const lines = text.split('\n')
+  if (lines.length <= COLLAPSED_TEXT_LINES && text.length <= LONG_TEXT_THRESHOLD) return text
+
+  const preview = lines.slice(0, COLLAPSED_TEXT_LINES).join('\n')
+  const hiddenLines = Math.max(0, lines.length - COLLAPSED_TEXT_LINES)
+  if (hiddenLines > 0) {
+    return `${preview}\n\n... 已折叠 ${hiddenLines} 行，点击“展开全部”查看完整日志`
+  }
+  return `${text.slice(0, LONG_TEXT_THRESHOLD)}\n\n... 内容较长，点击“展开全部”查看完整输出`
 }
 
 function flatObj(d: any): Record<string, any> {
@@ -782,15 +928,71 @@ function formatJson(v: any): string {
   .col-avail { color: #059669; font-weight: 600; }
 }
 
+.cmd-output-wrap {
+  min-width: 0;
+}
+
+.output-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.output-hint {
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #64748b;
+}
+
+.output-toggle {
+  flex-shrink: 0;
+  padding: 5px 10px;
+  border-radius: 6px;
+  border: 1px solid #bfdbfe;
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+
+  &:hover {
+    background: #dbeafe;
+    border-color: #93c5fd;
+  }
+}
+
+.output-window {
+  max-height: 320px;
+  overflow: auto;
+  border-radius: 10px;
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+
+  &.expanded {
+    max-height: min(70vh, 720px);
+  }
+
+  .tc-code {
+    max-height: none;
+    border: 0;
+    border-radius: 0;
+  }
+}
+
 // 美观的表格样式
 .cmd-table-container {
   background: #ffffff;
   border-radius: 10px;
-  overflow: hidden;
+  overflow: auto;
   border: 1px solid #f1f5f9;
 }
 .pretty-table {
   width: 100%;
+  min-width: 720px;
   border-collapse: separate;
   border-spacing: 0;
   font-size: 13px;

@@ -42,7 +42,15 @@
             </div>
             <div class="field">
               <label>API Key</label>
-              <el-input v-model="settings.llm.apiKey" type="password" show-password size="default" :disabled="formDisabled" />
+              <span class="field-hint">已配置密钥不可查看，留空表示不修改；输入新值即可更换</span>
+              <el-input
+                v-model="settings.llm.apiKey"
+                type="password"
+                autocomplete="new-password"
+                size="default"
+                :disabled="formDisabled"
+                :placeholder="settings.llm.apiKeySet ? '已配置（输入新值可更换）' : '请输入 API Key'"
+              />
             </div>
             <div class="field-row">
               <div class="field">
@@ -150,6 +158,7 @@ const settings = reactive({
     apiBase: '',
     model: '',
     apiKey: '',
+    apiKeySet: false,
     temperature: 0.1,
     maxTokens: 4096,
   },
@@ -264,9 +273,16 @@ async function loadHealth() {
 }
 
 function buildSavePayload() {
-  const payload: Record<string, unknown> = {
-    llm: { ...settings.llm },
+  const llm: Record<string, unknown> = {
+    apiBase: settings.llm.apiBase,
+    model: settings.llm.model,
+    temperature: settings.llm.temperature,
+    maxTokens: settings.llm.maxTokens,
   }
+  const nextKey = settings.llm.apiKey.trim()
+  if (nextKey) llm.apiKey = nextKey
+
+  const payload: Record<string, unknown> = { llm }
   if (isAdmin.value) {
     payload.security = {
       approvalTimeout: settings.security.approvalTimeout,
@@ -300,6 +316,10 @@ async function saveSettings() {
 
   try {
     await apiPromise
+    if (settings.llm.apiKey.trim()) {
+      settings.llm.apiKeySet = true
+      settings.llm.apiKey = ''
+    }
     puzzlePhase.value = 'success'
     applyToolsData((await getTools()).items)
     await wait(2400)
@@ -338,7 +358,14 @@ async function initSettings() {
       getTools(),
     ])
     if (configData) {
-      if (configData.llm) Object.assign(settings.llm, configData.llm)
+      if (configData.llm) {
+        settings.llm.apiBase = configData.llm.apiBase ?? settings.llm.apiBase
+        settings.llm.model = configData.llm.model ?? settings.llm.model
+        settings.llm.temperature = configData.llm.temperature ?? settings.llm.temperature
+        settings.llm.maxTokens = configData.llm.maxTokens ?? settings.llm.maxTokens
+        settings.llm.apiKeySet = Boolean(configData.llm.apiKeySet)
+        settings.llm.apiKey = ''
+      }
       if (configData.security) {
         settings.security.approvalTimeout = configData.security.approvalTimeout ?? settings.security.approvalTimeout
         settings.security.maxRounds =
@@ -636,8 +663,16 @@ onMounted(() => {
     font-size: 11px;
     font-weight: 600;
     color: #94a3b8;
-    margin-bottom: 4px;
+    margin-bottom: 2px;
     letter-spacing: 0.04em;
+  }
+
+  .field-hint {
+    display: block;
+    font-size: 9px;
+    color: #94a3b8;
+    margin-bottom: 6px;
+    line-height: 1.35;
   }
 }
 

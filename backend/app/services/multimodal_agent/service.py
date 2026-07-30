@@ -88,7 +88,9 @@ def _has_ops_problem(content: str) -> bool:
 def _asks_for_execution(content: str) -> bool:
     text = (content or "").lower()
     markers = (
-        "执行", "实施", "处理一下", "帮我处理", "帮我解决", "帮我修复", "直接修复",
+        "执行", "实施", "处理一下", "帮我处理", "给我处理", "帮我解决", "给我解决",
+        "帮我处理上述图", "给我处理上述图", "帮我处理上图", "给我处理上图",
+        "帮我修复", "直接修复",
         "开始排查", "自动排查", "进入排查", "实际解决", "连接服务器", "plan-execute",
         "plan execute", "按方案执行", "继续执行", "execute", "run the plan", "fix it",
         "repair it", "troubleshoot it", "start troubleshooting",
@@ -121,18 +123,139 @@ def _asks_for_answer_only(content: str) -> bool:
     )
 
 
+DEEP_INTENT_PLAN_EXECUTE = "deep_plan_execute_request"
+DEEP_INTENT_PROFESSIONAL_ANSWER = "deep_professional_answer"
+DEEP_INTENT_CLARIFICATION = "deep_clarification_required"
+DEEP_INTENT_MULTIMODAL_QA = "deep_multimodal_qa"
+
+
+def _vision_indicates_ops_problem(vision_results: List[Dict[str, Any]]) -> bool:
+    text = "\n".join(
+        str(v.get("detail") or v.get("summary") or "")
+        for v in (vision_results or [])
+    ).lower()
+    if not text.strip():
+        return False
+    markers = (
+        "故障", "异常", "报错", "失败", "无法", "不能", "登录循环", "黑屏",
+        "图形界面", "桌面", "密码", "kylin", "麒麟", "error", "failed",
+    )
+    return any(m in text for m in markers)
+
+
+def _solution_markers_present(content: str) -> bool:
+    markers = (
+        "方案", "解决方案", "怎么解决", "如何解决", "如何处理", "怎么处理",
+        "图文", "图文结合", "solution", "how to fix", "how to resolve",
+        "how to troubleshoot", "guide",
+    )
+    return any(m in (content or "").lower() for m in markers)
+
+
+def _route_deep_intent(
+    content: str,
+    attachments: List[Dict[str, Any]],
+    vision_results: List[Dict[str, Any]],
+    rag_result: Dict[str, Any],
+    forced_intent: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Supervisor Router for deep-thinking multimodal requests.
+
+    It distinguishes executable remediation from professional answer generation.
+    The decision is intentionally explicit so downstream nodes do not infer
+    whether they are allowed to create a server execution plan.
+    """
+    has_image = bool(attachments)
+    ops_problem = (
+        _has_ops_problem(content)
+        or _vision_indicates_ops_problem(vision_results)
+        or bool(rag_result.get("text_results") and _solution_markers_present(content))
+    )
+    execution_signal = _asks_for_execution(content)
+    answer_only_signal = _asks_for_answer_only(content)
+    professional_signal = _asks_for_professional_answer(content)
+    solution_signal = _solution_markers_present(content)
+
+    if forced_intent == "plan_execute":
+        intent = DEEP_INTENT_PLAN_EXECUTE
+        reason = "用户已选择进入 Plan-Execute 执行链路"
+        confidence = 0.99
+    elif forced_intent == "professional_answer":
+        intent = DEEP_INTENT_PROFESSIONAL_ANSWER
+        reason = "用户已选择生成专业图文方案"
+        confidence = 0.99
+    elif answer_only_signal:
+        intent = DEEP_INTENT_PROFESSIONAL_ANSWER
+        reason = "用户明确要求分析/图文/表格/流程图，不执行服务器操作"
+        confidence = 0.93
+    elif execution_signal and (ops_problem or has_image):
+        intent = DEEP_INTENT_PLAN_EXECUTE
+        reason = "用户表达了修复/处理/解决诉求，需先生成可确认执行方案"
+        confidence = 0.9
+    elif ops_problem and professional_signal:
+        intent = DEEP_INTENT_PROFESSIONAL_ANSWER
+        reason = "故障问题但诉求是专业图文分析报告"
+        confidence = 0.88
+    elif (ops_problem or has_image) and solution_signal:
+        intent = DEEP_INTENT_CLARIFICATION
+        reason = "故障解决诉求较模糊，需确认是只要方案还是要执行"
+        confidence = 0.68
+    elif ops_problem:
+        intent = DEEP_INTENT_PROFESSIONAL_ANSWER
+        reason = "识别到运维故障现象，默认先输出分析报告"
+        confidence = 0.74
+    elif has_image:
+        intent = DEEP_INTENT_MULTIMODAL_QA
+        reason = "有图片输入但未识别到明确运维执行诉求"
+        confidence = 0.72
+    else:
+        intent = DEEP_INTENT_MULTIMODAL_QA
+        reason = "深度知识问答"
+        confidence = 0.65
+
+    labels = {
+        DEEP_INTENT_PLAN_EXECUTE: "深度执行方案",
+        DEEP_INTENT_PROFESSIONAL_ANSWER: "专业图文回答",
+        DEEP_INTENT_CLARIFICATION: "等待意图澄清",
+        DEEP_INTENT_MULTIMODAL_QA: "多模态问答",
+    }
+    workflow_links = {
+        DEEP_INTENT_PLAN_EXECUTE: "deep_plan_execute",
+        DEEP_INTENT_PROFESSIONAL_ANSWER: "deep_professional_answer",
+        DEEP_INTENT_CLARIFICATION: "deep_clarification",
+        DEEP_INTENT_MULTIMODAL_QA: "deep_multimodal_qa",
+    }
+    return {
+        "intent": intent,
+        "label": labels[intent],
+        "confidence": confidence,
+        "reason": reason,
+        "needClarification": intent == DEEP_INTENT_CLARIFICATION,
+        "executionRequested": intent == DEEP_INTENT_PLAN_EXECUTE,
+        "executionAllowed": intent == DEEP_INTENT_PLAN_EXECUTE,
+        "answerOnly": intent in (DEEP_INTENT_PROFESSIONAL_ANSWER, DEEP_INTENT_MULTIMODAL_QA),
+        "workflowLink": workflow_links[intent],
+        "signals": {
+            "hasImage": has_image,
+            "opsProblem": ops_problem,
+            "executionSignal": execution_signal,
+            "professionalSignal": professional_signal,
+            "answerOnlySignal": answer_only_signal,
+            "solutionSignal": solution_signal,
+        },
+    }
+
+
 def _needs_intent_clarification(content: str, route: Dict[str, Any]) -> bool:
+    if route.get("needClarification"):
+        return True
     if route.get("link") != "deep_plan_execute":
         return False
     if not _has_ops_problem(content):
         return False
     if _asks_for_execution(content) or _asks_for_answer_only(content):
         return False
-    solution_markers = (
-        "方案", "解决方案", "怎么解决", "如何解决", "如何处理", "图文", "图文结合",
-        "solution", "how to fix", "how to resolve", "how to troubleshoot", "guide",
-    )
-    return any(m in (content or "").lower() for m in solution_markers)
+    return _solution_markers_present(content)
 
 
 def _intent_clarification_payload(content: str, trace_id: str) -> Dict[str, Any]:
@@ -247,6 +370,42 @@ def _route_deep_link(content: str, attachments: List[Dict[str, Any]], rag_result
     return {"link": link, "linkLabel": label, "linkDescription": desc}
 
 
+def _vision_text(vision_results: List[Dict[str, Any]]) -> str:
+    return "\n".join(
+        str(v.get("detail") or v.get("summary") or "")
+        for v in (vision_results or [])
+        if str(v.get("detail") or v.get("summary") or "").strip()
+    )
+
+
+def _combined_problem_text(content: str, vision_results: List[Dict[str, Any]]) -> str:
+    vision = _vision_text(vision_results)
+    if not vision:
+        return content or ""
+    return f"{content or ''}\n\n[Vision Expert 识别]\n{vision}".strip()
+
+
+def _is_login_loop_problem(content: str, vision_results: List[Dict[str, Any]]) -> bool:
+    text = _combined_problem_text(content, vision_results).lower()
+    if not text.strip():
+        return False
+    strong_markers = (
+        "登录循环", "反复跳转登录", "反复回到登录", "无法进入桌面", "进不了桌面",
+        "输入密码后", "输入密码", "登录界面", "图形界面", "桌面环境",
+        "display manager", "login loop", "back to login", "cannot enter desktop",
+    )
+    technical_markers = (
+        "gdm", "lightdm", "sddm", "xauthority", ".xauthority",
+        "xsession", ".xsession-errors", "pam", "session",
+    )
+    return any(m in text for m in strong_markers) and (
+        "登录" in text
+        or "密码" in text
+        or "桌面" in text
+        or any(m in text for m in technical_markers)
+    )
+
+
 def _build_boot_failure_plan(content: str, rag_result: Dict[str, Any], vision_results: List[Dict[str, Any]]) -> Dict[str, Any]:
     sources = [r.get("title") for r in rag_result.get("text_results", [])[:3]]
     vision_note = "；".join(v.get("summary", "")[:120] for v in vision_results[:2])
@@ -349,6 +508,114 @@ def _build_boot_failure_plan(content: str, rag_result: Dict[str, Any], vision_re
     }
 
 
+def _build_login_loop_plan(content: str, rag_result: Dict[str, Any], vision_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    sources = [r.get("title") for r in rag_result.get("text_results", [])[:3]]
+    problem_text = _combined_problem_text(content, vision_results)
+    vision_note = "；".join(v.get("summary", "")[:120] for v in vision_results[:2])
+    return {
+        "plan_type": "multimodal_plan_execute",
+        "title": "麒麟系统登录循环故障排查与修复方案",
+        "phenomenon": problem_text[:300],
+        "query_goal": "定位输入密码后反复跳转登录界面、无法进入桌面的原因，并按只读排查优先、修复动作审批的方式逐步处理。",
+        "possible_causes": [
+            "用户会话文件或 Xauthority 权限异常，导致图形会话启动后立即退出",
+            "GDM/LightDM/SDDM 显示管理器异常或桌面环境组件启动失败",
+            "PAM 认证、账户锁定或密码状态异常导致会话无法建立",
+            "根分区或用户家目录空间不足，桌面会话无法写入运行时文件",
+        ],
+        "steps": [
+            {
+                "order": 1,
+                "agent": "Tool Executor",
+                "action": "确认当前可通过 SSH 或控制台命令通道访问系统；若本地桌面无法进入，请先切换 TTY 后再继续",
+                "tool_hint": "execute_command: whoami",
+                "risk": "L1",
+                "core": True,
+                "expected": "返回当前执行用户，证明排查命令通道可用",
+            },
+            {
+                "order": 2,
+                "agent": "Tool Executor",
+                "action": "检查最近系统认证与会话日志，寻找 PAM、session、gdm、lightdm、sddm 等登录失败线索",
+                "tool_hint": "execute_command: journalctl -n 120 --no-pager",
+                "risk": "L1",
+                "core": True,
+                "expected": "获得最近登录、认证、桌面会话启动/退出相关日志",
+            },
+            {
+                "order": 3,
+                "agent": "Tool Executor",
+                "action": "列出可登录账户，辅助确认目标用户是否存在、家目录与默认 shell 是否正常",
+                "tool_hint": "get_users",
+                "risk": "L1",
+                "core": True,
+                "expected": "返回普通登录用户、UID/GID、家目录和 shell 信息",
+            },
+            {
+                "order": 4,
+                "agent": "Tool Executor",
+                "action": "检查 GDM 显示管理器状态；若系统实际使用 lightdm 或 sddm，后续按同样方式替换服务名复查",
+                "tool_hint": "get_service_status:gdm",
+                "risk": "L1",
+                "core": True,
+                "expected": "确认显示管理器是否 active、是否存在异常退出或启动失败",
+            },
+            {
+                "order": 5,
+                "agent": "Tool Executor",
+                "action": "检查当前用户图形会话文件是否存在异常，重点关注 .Xauthority 与 .xsession-errors",
+                "tool_hint": "execute_command: ls -la $HOME/.Xauthority $HOME/.xsession-errors",
+                "risk": "L1",
+                "core": True,
+                "expected": "确认会话文件是否存在、权限/属主是否明显异常；文件缺失也会作为诊断线索记录",
+            },
+            {
+                "order": 6,
+                "agent": "Tool Executor",
+                "action": "在确认日志和会话文件指向显示管理器异常后，重启 GDM 以重新拉起图形登录服务",
+                "tool_hint": "manage_service restart gdm",
+                "risk": "L3",
+                "core": False,
+                "expected": "GDM 重启完成，登录界面重新加载；该步骤触发人工确认",
+                "rollback": "若重启后图形界面异常扩大，切换 TTY 或 SSH 后查看 journalctl -u gdm -n 120，并按现场实际服务名恢复/再次启动显示管理器。",
+            },
+            {
+                "order": 7,
+                "agent": "Tool Executor",
+                "action": "检查磁盘空间，排除根分区或用户家目录空间不足导致桌面会话无法写入",
+                "tool_hint": "get_disk_usage",
+                "risk": "L1",
+                "core": True,
+                "expected": "返回各挂载点容量、可用空间和使用率，判断是否存在满盘风险",
+            },
+        ],
+        "manual_steps": [
+            "如果图形界面无法登录，请先在虚拟机控制台按 Ctrl+Alt+F2/F3 切换 TTY，或使用 SSH 登录后执行排查命令。",
+            "若第 4 步显示 gdm 未安装或未找到，请根据系统实际显示管理器改查 lightdm 或 sddm。",
+            "若确认 .Xauthority 或 .xsession-errors 属主/权限异常，移动、删除、chown、chmod 等修复动作必须拆成独立 L2-L4 步骤并再次确认或审批。",
+            "若根分区或 /home 满盘，清理日志/缓存也必须另行生成带回滚说明的执行步骤。",
+        ],
+        "planned_commands": [
+            "whoami",
+            "journalctl -n 120 --no-pager",
+            "get_users",
+            "systemctl status gdm",
+            "ls -la $HOME/.Xauthority $HOME/.xsession-errors",
+            "systemctl restart gdm",
+            "df -h",
+        ],
+        "risk_note": "步骤 1、2、3、4、5、7 为 L1 只读排查；步骤 6 为重启显示管理器的 L3 操作，必须进入人工确认链路。",
+        "requires_confirm": True,
+        "rag_sources": [{"title": s} for s in sources if s],
+        "rag_reference": (rag_result.get("context") or "")[:400] or None,
+        "multimodal_context": {
+            "vision_summary": vision_note,
+            "image_count": len(vision_results),
+            "image_candidates": rag_result.get("image_results", [])[:3],
+        },
+    }
+
+
 async def _build_plan(
     content: str,
     rag_result: Dict[str, Any],
@@ -358,10 +625,18 @@ async def _build_plan(
     # Keep planning eligibility aligned with Supervisor routing. Previously a query could
     # route to deep ops because it mentioned a virtual machine, then fail to build the
     # visual plan because this function used a narrower keyword list.
-    if not _has_ops_problem(content):
+    diagnostic_content = _combined_problem_text(content, vision_results)
+    if not (
+        _has_ops_problem(diagnostic_content)
+        or _vision_indicates_ops_problem(vision_results)
+        or (_asks_for_execution(diagnostic_content) and bool(vision_results))
+    ):
         return None
 
-    t = (content or "").lower()
+    if _is_login_loop_problem(content, vision_results):
+        return _build_login_loop_plan(content, rag_result, vision_results)
+
+    t = (diagnostic_content or "").lower()
     boot_markers = (
         "开机", "启动失败", "无法启动", "无法开机", "boot", "logo", "虚拟机",
         "fails to start", "failed to start", "startup failure", "start failure", "cannot start",
@@ -372,10 +647,10 @@ async def _build_plan(
 
     try:
         from app.services.human_supervision import build_diagnostic_plan, enrich_diagnostic_plan_with_env
-        plan = await build_diagnostic_plan(content, "fault_analysis", rag_result.get("context") or "")
+        plan = await build_diagnostic_plan(diagnostic_content, "fault_analysis", rag_result.get("context") or "")
         plan = await enrich_diagnostic_plan_with_env(
             plan,
-            content,
+            diagnostic_content,
             rag_result.get("context") or "",
             sensing_mode="fault_diagnosis",
             server_id=server_id,
@@ -861,6 +1136,9 @@ async def process_multimodal_message(
                 ),
             }
     rag_result["image_results"] = accepted_images or []
+    # Before routing is finalized, use a broad signal to decide whether visual
+    # assistance is useful. The strict execution decision is made by Supervisor
+    # Router below.
     needs_visual_answer = forced_intent == "professional_answer" or _has_ops_problem(text)
     if not accepted_images and needs_visual_answer:
         yield _answer_media(
@@ -908,13 +1186,32 @@ async def process_multimodal_message(
             caption=image.get("description") or image.get("snippet") or "用于辅助理解对应排查步骤。",
         )
 
+    deep_intent = _route_deep_intent(
+        text,
+        saved_attachments,
+        vision_results,
+        rag_result,
+        forced_intent=forced_intent,
+    )
     route = _route_deep_link(text, saved_attachments, rag_result)
+    route.update({
+        "link": deep_intent["workflowLink"],
+        "linkLabel": deep_intent["label"],
+        "linkDescription": deep_intent["reason"],
+        "needClarification": deep_intent["needClarification"],
+    })
+    yield _sse("deep_intent_resolved", {
+        "traceId": trace_id,
+        **deep_intent,
+    })
     yield _sse("route_dispatch", {
         "link": route["link"],
         "linkLabel": route["linkLabel"],
         "linkDescription": route["linkDescription"],
-        "reason": "用户选择深度思考或提供图片，进入独立多模态链路",
-        "intent": "multimodal_ops",
+        "reason": deep_intent["reason"],
+        "intent": deep_intent["intent"],
+        "confidence": deep_intent["confidence"],
+        "executionRequested": deep_intent["executionRequested"],
     })
 
     if forced_intent is None and _needs_intent_clarification(text, route):
@@ -940,10 +1237,18 @@ async def process_multimodal_message(
         return
 
     plan = None
-    if forced_intent != "professional_answer" and not _asks_for_answer_only(text):
+    if deep_intent["executionRequested"]:
         yield _sse("agent_handoff", {"from": "Supervisor", "to": "Ops Diagnosis Planner", "reason": "用户已确认或表达需要执行方案"})
         plan = await _build_plan(text, rag_result, vision_results, server_id)
     if plan:
+        plan["execution_policy"] = {
+            "mode": "confirm_then_execute",
+            "requires_plan_confirm": True,
+            "requires_step_risk_check": True,
+            "allow_without_user_confirm": False,
+            "summary": "先输出完整方案；用户确认后按 L1-L5 安全分级、审批、回滚链路执行。",
+        }
+        plan["requires_confirm"] = True
         from app.services.human_supervision import save_supervision_plan
         yield _sse("agent_handoff", {"from": "Supervisor", "to": "Answer Composer", "reason": "执行前先生成图文结合说明"})
         yield _step("compose", "Answer Composer", "先生成图文结合故障说明")
@@ -1003,7 +1308,7 @@ async def process_multimodal_message(
         )
         intro = (
             "已生成 **深度思考 Plan-Execute 运维方案**。"
-            "该方案已转换为可执行步骤，确认后会复用现有安全门禁、审批、确认与回滚链路逐步执行。\n\n"
+            "请先完整核对方案；选择“是，帮我按上述方案解决问题”后，系统才会复用现有安全门禁、审批、确认与回滚链路逐步执行。\n\n"
         )
         if plan.get("preliminary_analysis"):
             intro += str(plan["preliminary_analysis"]) + "\n\n"
@@ -1011,6 +1316,7 @@ async def process_multimodal_message(
             f"- 可自动执行步骤：{len(plan.get('steps') or [])} 步\n"
             f"- 人工处理建议：{len(plan.get('manual_steps') or [])} 条\n"
             "- 自动步骤仅包含只读排查或经过风险分级的操作；不会在未确认时执行。\n"
+            "- 执行选择：是，帮我按上述方案解决问题 / 否，不需要执行。\n"
         )
         yield _sse("token", {"token": "\n\n---\n\n" + intro.strip()})
         full_response = stored_response.strip() + "\n\n---\n\n" + intro.strip()
@@ -1045,8 +1351,17 @@ async def process_multimodal_message(
     yield _sse("agent_handoff", {"from": "Supervisor", "to": "Answer Composer", "reason": "汇总专家结果并生成图文回答"})
     yield _step("compose", "Answer Composer", "生成标准化图文回答")
     answer_plan = plan
-    if forced_intent == "professional_answer" or _asks_for_answer_only(text):
+    if deep_intent["answerOnly"] or forced_intent == "professional_answer" or _asks_for_answer_only(text):
         answer_plan = await _build_plan(text, rag_result, vision_results, server_id)
+        if answer_plan:
+            answer_plan["execution_policy"] = {
+                "mode": "plan_only",
+                "requires_plan_confirm": False,
+                "requires_step_risk_check": False,
+                "allow_without_user_confirm": False,
+                "summary": "仅用于图文分析报告，不触发服务器执行。",
+            }
+            answer_plan["requires_confirm"] = False
     diagram_task = None
     if answer_plan:
         yield _answer_media("solution-flowchart", "diagram", "pending", "处理流程图", caption="正在生成标准化故障处理流程。")

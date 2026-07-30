@@ -636,11 +636,12 @@ async def _save_pending_execution(
     need_confirm: bool = False,
     approval_id: str = None,
 ) -> PendingExecution:
+    approval_ref = approval_id or ""
     pe = PendingExecution(
         session_id=session_id,
         trace_id=trace_id,
         user_id=user_id,
-        approval_id=approval_id,
+        approval_id=approval_ref,
         tool_name=tool_name,
         tool_params_json=json.dumps(tool_args, ensure_ascii=False),
         risk_level=risk_level,
@@ -693,6 +694,277 @@ def _plan_skip_reason(step: dict, tool_name: str, tool_args: dict, records: list
         if tool_name in ("manage_service", "execute_command"):
             return "前置打印服务未安装，跳过本步；请先安装 cups 与 avahi-daemon"
     return None
+
+
+SERVICE_PACKAGE_MAP = {
+    "gdm": "gdm",
+    "gdm3": "gdm",
+    "lightdm": "lightdm",
+    "sddm": "sddm",
+    "cups": "cups",
+    "cupsd": "cups",
+    "avahi-daemon": "avahi",
+    "nginx": "nginx",
+}
+
+COMMAND_PACKAGE_MAP = {
+    "ifconfig": "net-tools",
+    "netstat": "net-tools",
+    "semanage": "policycoreutils-python-utils",
+    "gcc": "gcc",
+    "make": "make",
+    "curl": "curl",
+    "wget": "wget",
+}
+
+
+def _failure_text(result: dict) -> str:
+    data = (result or {}).get("data") or {}
+    parts = [
+        (result or {}).get("error"),
+        (result or {}).get("display_summary"),
+        data.get("summary"),
+        data.get("stdout"),
+        data.get("stderr"),
+        data.get("raw"),
+        data.get("raw_status"),
+    ]
+    return "\n".join(str(p) for p in parts if p)
+
+
+def _package_install_command(packages: list[str]) -> str:
+    pkg = " ".join(dict.fromkeys(p for p in packages if p))
+    return (
+        "if command -v dnf >/dev/null 2>&1; then dnf install -y {pkg}; "
+        "elif command -v yum >/dev/null 2>&1; then yum install -y {pkg}; "
+        "elif command -v apt-get >/dev/null 2>&1; then apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y {pkg}; "
+        "else echo '未找到 dnf/yum/apt-get，无法自动安装依赖包'; exit 127; fi"
+    ).format(pkg=pkg)
+
+
+def _extract_missing_service(tool_name: str, tool_args: dict, result: dict) -> Optional[str]:
+    data = (result or {}).get("data") or {}
+    svc = (
+        (tool_args or {}).get("service_name")
+        or (tool_args or {}).get("service")
+        or data.get("service")
+    )
+    text = _failure_text(result).lower()
+    if tool_name == "get_service_status" and (data.get("state") or "").lower() == "not-found":
+        return str(svc) if svc else None
+    if tool_name == "manage_service":
+        if "not-found" in text or "not found" in text or "could not be found" in text or "未找到" in text or "未安装" in text:
+            return str(svc) if svc else None
+    m = re.search(r"unit\s+([a-zA-Z0-9_.@-]+)\.service\s+(?:not\s+found|could\s+not\s+be\s+found)", text)
+    return m.group(1) if m else None
+
+
+def _extract_missing_command(result: dict) -> Optional[str]:
+    text = _failure_text(result)
+    patterns = (
+        r"([a-zA-Z0-9_.+-]+):\s*command not found",
+        r"command not found:\s*([a-zA-Z0-9_.+-]+)",
+        r"未找到命令[:：]?\s*([a-zA-Z0-9_.+-]+)",
+    )
+    for pat in patterns:
+        m = re.search(pat, text, re.I)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _build_failure_remediation(tool_name: str, tool_args: dict, result: dict, step: dict, failed_record: dict = None) -> Optional[dict]:
+    """将可补救的执行失败转换为一个待确认的修复命令。"""
+    if (failed_record or {}).get("planSubStep") == "auto_remediation":
+        return None
+    original_cmd = str((tool_args or {}).get("command") or "")
+    if re.search(r"\b(dnf|yum|apt-get)\s+(install|update)\b", original_cmd, re.I):
+        return None
+
+    service = _extract_missing_service(tool_name, tool_args, result)
+    if service:
+        pkg = SERVICE_PACKAGE_MAP.get(service.lower(), service)
+        return {
+            "toolName": "execute_command",
+            "params": {"command": _package_install_command([pkg]), "timeout": 180},
+            "reason": f"检测到服务 {service} 未找到或未安装",
+            "action": f"补救：安装 {pkg} 依赖包",
+            "expected": f"{pkg} 安装完成后，继续执行原方案后续步骤",
+        }
+
+    missing_cmd = _extract_missing_command(result)
+    if missing_cmd:
+        pkg = COMMAND_PACKAGE_MAP.get(missing_cmd.lower(), missing_cmd)
+        return {
+            "toolName": "execute_command",
+            "params": {"command": _package_install_command([pkg]), "timeout": 180},
+            "reason": f"检测到命令 {missing_cmd} 不存在，可能未安装对应工具",
+            "action": f"补救：安装 {pkg} 工具包",
+            "expected": f"{pkg} 安装完成后，继续执行原方案后续步骤",
+        }
+
+    text = _failure_text(result)
+    m = re.search(r"(/home/([a-zA-Z_][a-zA-Z0-9_-]{0,31})/\.Xauthority)", text)
+    if m and re.search(r"no such file or directory|没有那个文件|不存在|无法访问", text, re.I):
+        path, username = m.group(1), m.group(2)
+        home = f"/home/{username}"
+        cmd = (
+            f"id -u {username} >/dev/null 2>&1 && "
+            f"install -d -m 700 -o {username} -g {username} {home} && "
+            f"touch {path} && chown {username}:{username} {path} && chmod 600 {path}"
+        )
+        return {
+            "toolName": "execute_command",
+            "params": {"command": cmd, "timeout": 30},
+            "reason": f"检测到 {path} 缺失",
+            "action": f"补救：创建并修正 {username} 的 .Xauthority 权限",
+            "expected": "文件存在且属主/权限正确后，继续执行原方案后续步骤",
+        }
+
+    return None
+
+
+def _has_same_pending_remediation(records: list, command: str) -> bool:
+    for rec in records or []:
+        if rec.get("planSubStep") != "auto_remediation":
+            continue
+        rec_cmd = str((rec.get("params") or {}).get("command") or "")
+        if rec_cmd == command and rec.get("status") in ("pending_confirm", "pending_approval", "executing", "completed"):
+            return True
+    return False
+
+
+async def _queue_failure_remediation(
+    db: AsyncSession,
+    session_id: str,
+    trace_id: str,
+    user_id: str,
+    step: dict,
+    plan_data: dict,
+    messages: list,
+    state: dict,
+    failed_tool_name: str,
+    failed_tool_args: dict,
+    failed_result: dict,
+    failed_record: dict = None,
+):
+    remediation = _build_failure_remediation(
+        failed_tool_name, failed_tool_args, failed_result, step, failed_record,
+    )
+    if not remediation:
+        return
+
+    tool_name = remediation["toolName"]
+    tool_args = remediation["params"]
+    command = str(tool_args.get("command") or "")
+    if _has_same_pending_remediation(state.get("records") or [], command):
+        return
+
+    step_order = step.get("order") or (failed_record or {}).get("planStepOrder") or 0
+    step_total = len((plan_data or {}).get("steps") or []) or (failed_record or {}).get("planStepTotal")
+    action = remediation.get("action") or "补救：执行依赖修复命令"
+    tool_call_id = generate_id()
+
+    safety = _apply_plan_step_safety(_check_tool_safety(tool_name, tool_args), {"risk": "L2"})
+    yield {"event": "safety_decision", "data": json.dumps({
+        "toolName": tool_name,
+        "riskLevel": safety["risk_level"],
+        "blocked": safety["blocked"],
+        "requireConfirm": safety["require_confirm"],
+        "requireApproval": safety["require_approval"],
+        "remediation": True,
+    }, ensure_ascii=False)}
+
+    record_base = {
+        "id": tool_call_id,
+        "toolName": tool_name,
+        "params": tool_args,
+        "riskLevel": safety["risk_level"],
+        "planStepOrder": step_order,
+        "planStepTotal": step_total,
+        "planStepAction": action,
+        "planSubStep": "auto_remediation",
+        "remediationReason": remediation.get("reason"),
+        "remediationFor": (failed_record or {}).get("id"),
+        "commandPreview": preview_tool_command(tool_name, tool_args),
+    }
+
+    if safety["blocked"]:
+        state["records"].append({
+            **record_base,
+            "status": "blocked",
+            "result": {"success": False, "error": safety["block_message"]},
+        })
+        return
+
+    message = (
+        f"Ops Diagnosis Planner 检测到：{remediation.get('reason')}。\n"
+        f"建议先执行补救命令：{action}。\n"
+        f"预期结果：{remediation.get('expected')}。\n"
+        "请确认是否执行；确认完成后系统会继续原方案的后续步骤。"
+    )
+
+    if safety["require_approval"]:
+        now = datetime.utcnow()
+        approval = Approval(
+            trace_id=trace_id,
+            session_id=session_id,
+            tool_name=tool_name,
+            tool_params_json=json.dumps(tool_args, ensure_ascii=False),
+            risk_level=safety["risk_level"],
+            detail=message,
+            requested_by=user_id,
+            expires_at=now + timedelta(seconds=settings.approval_timeout),
+        )
+        db.add(approval)
+        await db.commit()
+        await db.refresh(approval)
+        pe = await _save_pending_execution(
+            db, session_id, trace_id, user_id,
+            tool_name, tool_args, safety["risk_level"],
+            messages_snapshot=_append_planned_resume_snapshot(messages, plan_data, state, step_order),
+            need_approval=True,
+            need_confirm=bool(safety.get("require_confirm")),
+            approval_id=approval.id,
+        )
+        record = {
+            **record_base,
+            "status": "pending_approval",
+            "approvalId": approval.id,
+            "pendingExecutionId": pe.id,
+        }
+        state["records"].append(record)
+        state["early_status"] = "awaiting_user_action"
+        state["approval_id"] = approval.id
+        yield {"event": "tool_call", "data": json.dumps(record, ensure_ascii=False)}
+        yield {"event": "need_approval", "data": json.dumps({
+            **record,
+            "message": message + f"\n请在审批管理页面确认（{settings.approval_timeout}秒超时）。",
+        }, ensure_ascii=False)}
+        yield _sse_exploring(f"remediate-{tool_call_id}", action, remediation.get("reason", ""), "done")
+        return
+
+    pe = await _save_pending_execution(
+        db, session_id, trace_id, user_id,
+        tool_name, tool_args, safety["risk_level"],
+        messages_snapshot=_append_planned_resume_snapshot(messages, plan_data, state, step_order),
+        need_confirm=True,
+    )
+    record = {
+        **record_base,
+        "status": "pending_confirm",
+        "pendingExecutionId": pe.id,
+    }
+    state["records"].append(record)
+    state["early_status"] = "awaiting_user_action"
+    yield {"event": "tool_call", "data": json.dumps(record, ensure_ascii=False)}
+    yield {"event": "need_confirm", "data": json.dumps({
+        **record,
+        "message": message,
+        "status": "pending_confirm",
+    }, ensure_ascii=False)}
+    yield _sse_exploring(f"remediate-{tool_call_id}", action, remediation.get("reason", ""), "done")
+    return
 
 
 PASSWORD_CUSTOM_TOOLS = frozenset({
@@ -891,6 +1163,10 @@ def _parse_plan_step_to_tool(step: dict, plan_data: dict = None) -> Optional[tup
         return ("get_network_info", {})
     if "get_disk_usage" in hint:
         return ("get_disk_usage", {})
+    if "get_users" in hint:
+        return ("get_users", {})
+    if "get_groups" in hint:
+        return ("get_groups", {})
 
     if "manage_service" in hint.lower() or hint.startswith("systemctl"):
         h = hint
@@ -1561,14 +1837,21 @@ async def _stream_plan_execute_command_for_step(
         "result": cmd_result,
         "displaySummary": cmd_result.get("display_summary", ""),
     }, ensure_ascii=False)}
-    state["records"].append({
+    failed_record = {
         "id": tool_call_id, "toolName": tool_name, "params": tool_args,
         "riskLevel": safety["risk_level"], "status": rec_status, "result": cmd_result,
         "displaySummary": cmd_result.get("display_summary", ""),
         "planStepOrder": step_order,
         "planStepTotal": steps_total,
         "planStepAction": step.get("action", ""),
-    })
+    }
+    state["records"].append(failed_record)
+    if rec_status == "failed":
+        async for ev in _queue_failure_remediation(
+            db, session_id, trace_id, user_id, step, plan_data, messages, state,
+            tool_name, tool_args, cmd_result, failed_record,
+        ):
+            yield ev
 
 
 async def _stream_custom_tool_plan_step(
@@ -1882,14 +2165,23 @@ async def _stream_planned_diagnostic_execution(
             "result": result,
             "displaySummary": result.get("display_summary", ""),
         }, ensure_ascii=False)}
-        state["records"].append({
+        failed_record = {
             "id": tool_call_id, "toolName": tool_name, "params": tool_args,
             "riskLevel": safety["risk_level"], "status": rec_status, "result": result,
             "displaySummary": result.get("display_summary", ""),
             "planStepOrder": step.get("order", 0),
             "planStepTotal": len(steps),
             "planStepAction": step.get("action", ""),
-        })
+        }
+        state["records"].append(failed_record)
+        if rec_status == "failed":
+            async for ev in _queue_failure_remediation(
+                db, session_id, trace_id, user_id, step, plan_data, messages, state,
+                tool_name, tool_args, result, failed_record,
+            ):
+                yield ev
+            if state.get("early_status"):
+                return
 
         yield _sse_exploring(
             f"plan-{tool_call_id}", f"步骤 {step.get('order')} 完成", tool_name,
@@ -4515,6 +4807,63 @@ async def resume_after_approval(db: AsyncSession, session_id: str, user_id: str,
         fb = await _fallback_planned_ctx(db, session_id, trace_id, [tool_call_record])
         if fb:
             planned_ctx = fb
+
+    if not exec_ok and planned_ctx and planned_ctx.get("plan_data"):
+        plan_data = planned_ctx.get("plan_data") or {}
+        step_order = tool_call_record.get("planStepOrder") or 0
+        step = next(
+            (s for s in (plan_data.get("steps") or []) if int(s.get("order", 0)) == int(step_order or 0)),
+            {
+                "order": step_order,
+                "action": tool_call_record.get("planStepAction") or tool_name,
+                "risk": tool_call_record.get("riskLevel") or risk,
+            },
+        )
+        remediation_state = {
+            "records": list(planned_ctx.get("records") or [tool_call_record]),
+            "early_status": None,
+            "approval_id": None,
+        }
+        async for ev in _queue_failure_remediation(
+            db, session_id, trace_id, user_id, step, plan_data, messages,
+            remediation_state, tool_name, tool_args, result, tool_call_record,
+        ):
+            yield ev
+        if remediation_state.get("early_status"):
+            user_question = (plan_data.get("phenomenon") or "").strip()
+            for m in reversed(messages):
+                if m.get("role") == "user" and m.get("content") and m["content"] not in ("(resume)", "[纭鎵ц鏂规]"):
+                    user_question = m["content"]
+                    break
+            tool_call_records = remediation_state["records"]
+            full_response = ""
+            async for ev in _yield_plan_step_progress(user_question, tool_call_records, plan_data):
+                yield ev
+            await save_message(db, session_id, "assistant", full_response, trace_id=trace_id)
+            await upsert_tool_call_message(db, session_id, tool_call_records, trace_id=trace_id)
+            from app.services.audit_service import upsert_chat_audit_record
+            await upsert_chat_audit_record(
+                db,
+                trace_id=trace_id,
+                session_id=session_id,
+                user_id=user_id,
+                question=user_question,
+                answer=full_response,
+                tool_call_records=tool_call_records,
+                flow_status=remediation_state.get("early_status") or "awaiting_user_action",
+                intent=planned_ctx.get("intent") or "",
+            )
+            yield {"event": "message_done", "data": json.dumps({
+                "messageId": assistant_msg_id,
+                "traceId": trace_id,
+                "status": remediation_state["early_status"],
+                "approvalId": remediation_state.get("approval_id"),
+                "pendingConfirm": any(tc.get("status") == "pending_confirm" for tc in tool_call_records),
+                "pendingApproval": any(tc.get("status") == "pending_approval" for tc in tool_call_records),
+                "planInProgress": True,
+            })}
+            return
+
     if planned_ctx and planned_ctx.get("plan_data") and _plan_has_remaining_steps(planned_ctx):
         async for ev in _stream_plan_continuation(
             db, session_id, trace_id, user_id, planned_ctx, tool_call_record,

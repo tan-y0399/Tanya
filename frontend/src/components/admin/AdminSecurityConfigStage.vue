@@ -29,7 +29,7 @@
           </div>
           <div class="metric-cell">
             <span class="m-label">KEY</span>
-            <span class="m-val">{{ llm.apiKey ? 'SET' : '—' }}</span>
+            <span class="m-val">{{ llm.apiKeySet || llm.apiKey ? 'SET' : '—' }}</span>
           </div>
         </div>
 
@@ -45,8 +45,14 @@
         </div>
         <div class="field">
           <label>API Key</label>
-          <span class="field-hint">留空表示不修改已保存的值</span>
-          <el-input v-model="llm.apiKey" type="password" show-password :disabled="saving" placeholder="••••••••" />
+          <span class="field-hint">已配置密钥不可查看，留空表示不修改；输入新值即可更换</span>
+          <el-input
+            v-model="llm.apiKey"
+            type="password"
+            autocomplete="new-password"
+            :disabled="saving"
+            :placeholder="llm.apiKeySet ? '已配置（输入新值可更换）' : '请输入 API Key'"
+          />
         </div>
         <div class="field-row">
           <div class="field">
@@ -113,6 +119,7 @@ export interface AdminLlmConfig {
   apiBase: string
   model: string
   apiKey: string
+  apiKeySet?: boolean
   temperature: number
   maxTokens: number
 }

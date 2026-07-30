@@ -621,6 +621,7 @@ const confirmedPlanArchive = ref<{
 } | null>(null)
 /** 方案执行中的轻量进度（非最终结论） */
 const planProgress = ref<PlanProgressPayload | null>(null)
+const deepExecutionRequested = ref(false)
 const continuePlanBusy = ref(false)
 const showTraceFeedback = ref(false)
 const showSessionFeedback = ref(false)
@@ -736,6 +737,7 @@ async function loadRollbackStatus() {
 }
 
 function computePlanProgressFromTools(): PlanProgressPayload | null {
+  if (!hasExecutableConfirmedPlan()) return null
   const arch = confirmedPlanArchive.value
   if (!arch?.plan?.steps?.length) return null
   const steps = arch.plan.steps as { order: number; action: string }[]
@@ -787,7 +789,10 @@ function computePlanProgressFromTools(): PlanProgressPayload | null {
 }
 
 /** 以工具卡合并结果为准；SSE plan_progress 仅作归档未就绪时的兜底 */
-const planProgressState = computed(() => computePlanProgressFromTools() || planProgress.value)
+const planProgressState = computed(() => {
+  if (!isExecutionContext()) return null
+  return computePlanProgressFromTools() || planProgress.value
+})
 
 function countTerminalPlanSteps(merged: PendingConfirmTool[], total: number): number {
   const terminal = new Set(['completed', 'failed', 'blocked', 'rejected'])
@@ -816,14 +821,15 @@ const planAllCompleted = computed(() => {
 })
 
 const planExecutionActive = computed(() => {
+  if (!isExecutionContext()) return false
   if (planAllCompleted.value) return false
-  if (confirmedPlanArchive.value) return true
+  if (hasExecutableConfirmedPlan()) return true
   const merged = getAllToolCallsMerged()
   return merged.some(t => !!(t as PendingConfirmTool).planStepTotal)
 })
 
 const hasInlinePlanConfirm = computed(() => {
-  if (!confirmedPlanArchive.value) return false
+  if (!hasExecutableConfirmedPlan()) return false
   return getAllToolCallsMerged().some(
     t => t.status === 'pending_confirm' && !!(t as PendingConfirmTool).planStepOrder,
   )
@@ -843,13 +849,13 @@ function needsInlineConfirm(tc: ToolCall) {
 
 function needsInlineApprovalNotice(tc: ToolCall) {
   if (needsInlineApprovedRun(tc)) return false
-  return confirmedPlanArchive.value
+  return hasExecutableConfirmedPlan()
     && tc.status === 'pending_approval'
     && !!(tc as PendingConfirmTool).planStepOrder
 }
 
 function needsInlineApprovedRun(tc: ToolCall): boolean {
-  if (!confirmedPlanArchive.value || !pendingAction.value) return false
+  if (!hasExecutableConfirmedPlan() || !pendingAction.value) return false
   if (pendingAction.value.type !== 'approved_run') return false
   const apvId = (tc as PendingConfirmTool & { approvalId?: string }).approvalId
   return apvId === pendingAction.value.approvalId
@@ -978,7 +984,7 @@ function tryContinueStuckPlan() {
     },
     onToolResult: (result: any) => applyToolResult(result),
     onPlanProgress: (payload: any) => {
-      if (payload) planProgress.value = payload
+      if (payload && shouldAllowPlanContinue()) planProgress.value = payload
       scrollToBottom()
     },
     onConfirmRequired: (confirm: any) => {
@@ -1188,6 +1194,29 @@ function isQaIntent(intent?: string | null): boolean {
   return i === 'knowledge_qa' || i === 'general_qa'
 }
 
+function isPlanOnly(plan?: Record<string, any> | null): boolean {
+  if (!plan) return false
+  const mode = plan.execution_policy?.mode
+  return mode === 'plan_only' || (mode !== 'confirm_then_execute' && plan.requires_confirm === false)
+}
+
+function isExecutablePlan(plan?: Record<string, any> | null): boolean {
+  if (!plan || isPlanOnly(plan)) return false
+  const mode = plan.execution_policy?.mode
+  if (mode) return mode === 'confirm_then_execute'
+  return plan.requires_confirm !== false
+}
+
+function hasExecutableConfirmedPlan(): boolean {
+  return !!confirmedPlanArchive.value && isExecutablePlan(confirmedPlanArchive.value.plan)
+}
+
+function isExecutionContext(): boolean {
+  if (deepExecutionRequested.value) return true
+  if (confirmedPlanArchive.value?.plan?.execution_policy?.mode === 'confirm_then_execute') return true
+  return !isQaIntent() && !isKnowledgeQaGroup(lastAgentGroup.value)
+}
+
 function getToolCallsForTrace(traceId?: string | null): PendingConfirmTool[] {
   if (!traceId) return []
   const raw: ToolCall[] = []
@@ -1270,9 +1299,8 @@ function showThinkingForGroup(group: (typeof groupedMessages.value)[number]): bo
 }
 
 function shouldAllowPlanContinue(): boolean {
-  if (isQaIntent()) return false
-  if (isKnowledgeQaGroup(lastAgentGroup.value)) return false
-  if (confirmedPlanArchive.value) return true
+  if (!isExecutionContext()) return false
+  if (hasExecutableConfirmedPlan()) return true
   const traceId = lastAgentGroup.value?.msg.traceId
   const tools = traceId ? getToolCallsForTrace(traceId) : []
   return tools.some(t => !!(t as PendingConfirmTool).planStepTotal)
@@ -1356,13 +1384,13 @@ function syncPlanProgressConclusion() {
   if (assistantHasFinalConclusion()) return
 
   const lastGroup = lastAgentGroup.value
-  if (!lastGroup?.tools.length && !confirmedPlanArchive.value) return
+  if (!lastGroup?.tools.length && !hasExecutableConfirmedPlan()) return
 
   const traceId = lastGroup?.msg.traceId
   const merged = traceId ? getToolCallsForTrace(traceId) : getAllToolCallsMerged()
   if (!merged.length) return
 
-  if (confirmedPlanArchive.value) {
+  if (hasExecutableConfirmedPlan()) {
     planProgress.value = computePlanProgressFromTools()
     if (planAllCompleted.value || isPlanCompleteFromTools()) {
       syncPlanFinalConclusion()
@@ -1457,7 +1485,7 @@ function syncPlanFinalConclusion() {
 /** 轻量 ReAct（无方案步骤）完成后，若后端未写入结论则前端补全 */
 function syncLightweightConclusion() {
   if (isQaIntent() || isKnowledgeQaGroup(lastAgentGroup.value)) return
-  if (confirmedPlanArchive.value || planExecutionActive.value) return
+  if (hasExecutableConfirmedPlan() || planExecutionActive.value) return
   if (shouldDeferClientConclusion()) return
   if (assistantHasFinalConclusion() || lastAssistantHasConclusion()) return
 
@@ -1619,6 +1647,7 @@ function planArchiveStorageKey(sessionId: string) {
 function persistPlanArchive() {
   const sid = chatStore.currentSessionId
   if (!sid || !confirmedPlanArchive.value) return
+  if (!isExecutablePlan(confirmedPlanArchive.value.plan)) return
   try {
     sessionStorage.setItem(planArchiveStorageKey(sid), JSON.stringify(confirmedPlanArchive.value))
   } catch { /* ignore */ }
@@ -1628,7 +1657,10 @@ function restorePlanArchive(sessionId: string) {
   confirmedPlanArchive.value = null
   try {
     const raw = sessionStorage.getItem(planArchiveStorageKey(sessionId))
-    if (raw) confirmedPlanArchive.value = JSON.parse(raw)
+    if (raw) {
+      const parsed = JSON.parse(raw)
+      if (isExecutablePlan(parsed?.plan)) confirmedPlanArchive.value = parsed
+    }
   } catch { /* ignore */ }
 }
 
@@ -1719,18 +1751,25 @@ function applyDiagnosticPlanDelta(delta: any) {
 }
 
 async function applyDiagnosticPlanPayload(payload: any) {
-  if (!payload?.planId) return
+  if (!payload?.planId) return false
+  const incomingPlan = {
+    ...(diagnosticPlan.value?.plan || {}),
+    ...(payload.plan || {}),
+    traceId: payload.traceId,
+  }
+  if (!isExecutionContext() || !isExecutablePlan(incomingPlan)) {
+    diagnosticPlan.value = null
+    planRiskMessage.value = null
+    chatStore.setResponsePhase('', '')
+    return false
+  }
   stopPlanFallbackPoll()
   if (!planRiskMessage.value) {
     planRiskMessage.value = '您的请求涉及高风险操作，相关指令将需要审批后方可执行。'
   }
   diagnosticPlan.value = {
     planId: payload.planId,
-    plan: {
-      ...(diagnosticPlan.value?.plan || {}),
-      ...(payload.plan || {}),
-      traceId: payload.traceId,
-    },
+    plan: incomingPlan,
     resolved: false,
     generating: false,
     traceId: payload.traceId,
@@ -1750,6 +1789,7 @@ async function applyDiagnosticPlanPayload(payload: any) {
   }
   chatStore.setStreaming(false)
   scrollToBottom()
+  return true
 }
 
 async function fetchPendingPlanFallback(sessionId: string) {
@@ -1757,8 +1797,7 @@ async function fetchPendingPlanFallback(sessionId: string) {
   try {
     const p = await getPendingPlan(sessionId)
     if (p?.planId && p?.plan) {
-      await applyDiagnosticPlanPayload(p)
-      return true
+      return await applyDiagnosticPlanPayload(p)
     }
   } catch { /* ignore */ }
   return false
@@ -2151,7 +2190,13 @@ interface PlanUiState {
 }
 
 function planUiForGroup(group: (typeof groupedMessages.value)[number]): PlanUiState | null {
-  if (diagnosticPlan.value && !diagnosticPlan.value.resolved && group === lastAgentGroup.value) {
+  if (
+    diagnosticPlan.value
+    && !diagnosticPlan.value.resolved
+    && group === lastAgentGroup.value
+    && isExecutionContext()
+    && isExecutablePlan(diagnosticPlan.value.plan)
+  ) {
     return {
       riskMessage: planRiskMessage.value,
       plan: diagnosticPlan.value.plan,
@@ -2164,7 +2209,7 @@ function planUiForGroup(group: (typeof groupedMessages.value)[number]): PlanUiSt
     }
   }
   const arch = confirmedPlanArchive.value
-  if (arch && arch.anchorGroupId === group.id) {
+  if (arch && arch.anchorGroupId === group.id && isExecutablePlan(arch.plan) && !isQaIntent() && !isKnowledgeQaGroup(group)) {
     return {
       riskMessage: arch.riskMessage,
       plan: arch.plan,
@@ -2295,6 +2340,8 @@ async function handleNewSession() {
   diagnosticPlan.value = null
   planRiskMessage.value = null
   confirmedPlanArchive.value = null
+  deepExecutionRequested.value = false
+  planProgress.value = null
   try {
     const data = await createSession()
     chatStore.setCurrentSession(data.id)
@@ -2311,6 +2358,8 @@ async function handleSelectSession(id: string) {
   activeFeedbackTraceId.value = null
   diagnosticPlan.value = null
   planRiskMessage.value = null
+  deepExecutionRequested.value = false
+  planProgress.value = null
   chatStore.setCurrentSession(id)
   chatStore.resetAgentState()
   try {
@@ -2503,6 +2552,8 @@ async function handleSend(
     }
     intentClarification.value = null
     diagnosticPlan.value = null
+    deepExecutionRequested.value = false
+    planProgress.value = null
     if (!isResume) {
       planRiskMessage.value = null
     }
@@ -2608,7 +2659,7 @@ async function handleSend(
         if (sid) startAwaitingRunPolling(sid)
       },
       onPlanProgress: (payload: any) => {
-        if (payload) planProgress.value = payload
+        if (payload && shouldAllowPlanContinue()) planProgress.value = payload
         scrollToBottom()
       },
       onConfirmRequired: (confirm: any) => {
@@ -2765,6 +2816,30 @@ async function handleSend(
           title: '图文知识检索',
           detail: `文本依据 ${textCount} 条，图片候选 ${imageCount} 张`,
           status: 'done',
+        })
+      },
+      onDeepIntentResolved: (payload: any) => {
+        deepExecutionRequested.value = !!payload?.executionRequested
+        if (!deepExecutionRequested.value) {
+          diagnosticPlan.value = null
+          confirmedPlanArchive.value = null
+          planProgress.value = null
+          planRiskMessage.value = null
+          const sid = chatStore.currentSessionId
+          if (sid) {
+            try { sessionStorage.removeItem(planArchiveStorageKey(sid)) } catch { /* ignore */ }
+          }
+        }
+        chatStore.setIntentResolved({
+          intent: payload?.intent,
+          label: payload?.label || payload?.intent,
+          confidence: payload?.confidence || 0,
+        })
+        chatStore.upsertExploringStep({
+          id: 'deep-intent-router',
+          title: 'Supervisor Router',
+          detail: payload?.reason || payload?.label || '深度意图已识别',
+          status: payload?.needClarification ? 'running' : 'done',
         })
       },
       onDeepPlan: (payload: any) => {
@@ -3092,6 +3167,7 @@ async function handleSend(
 
 function handlePlanConfirm() {
   if (!diagnosticPlan.value?.planId) return
+  if (!isExecutionContext() || !isExecutablePlan(diagnosticPlan.value.plan)) return
   const planId = diagnosticPlan.value.planId
   const anchor = lastAgentGroup.value
   if (anchor) {

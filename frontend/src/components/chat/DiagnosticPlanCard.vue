@@ -164,11 +164,11 @@
     </div>
 
     <footer v-if="mode === 'confirm'" v-show="visible.actions" class="plan-foot stream-in">
-      <span class="foot-hint">确认后将按步骤依次执行，写操作需您二次确认</span>
+      <span class="foot-hint">确认后将按步骤依次执行，写操作仍会按风险等级进入确认或审批</span>
       <div class="foot-actions">
-        <button type="button" class="btn-cancel" @click="$emit('cancel')">终止</button>
+        <button type="button" class="btn-cancel" @click="$emit('cancel')">否，不需要执行</button>
         <button type="button" class="btn-run" :disabled="!confirmable || generating" @click="$emit('confirm')">
-          {{ generating ? '方案生成中…' : '确认并执行' }}
+          {{ generating ? '方案生成中…' : '是，按方案执行' }}
           <span v-if="plan.steps?.length && !generating" class="btn-step-count">{{ plan.steps.length }} 步</span>
         </button>
       </div>

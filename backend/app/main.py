@@ -101,9 +101,9 @@ async def startup():
 
                 # 创建默认用户
                 db.add(User(username="admin", password_hash=hash_password("admin123"), role="admin"))
-                db.add(User(username="lk", password_hash=hash_password("lk666"), role="user"))
+                db.add(User(username="ty", password_hash=hash_password("ty666"), role="user"))
                 await db.commit()
-                logger.info("Seed users created: admin, lk")
+                logger.info("Seed users created: admin, ty")
 
             except Exception as e:
                 logger.error(f"Failed to initialize: {e}")
