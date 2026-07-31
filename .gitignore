@@ -67,6 +67,11 @@ npm-debug.log*
 # Init flags
 .initialized
 
+# Docker demo SSH keys (generated locally)
+deploy/docker/demo-keys/id_ed25519
+deploy/docker/demo-keys/id_ed25519.pub
+.env.docker
+
 # Alembic (if used)
 alembic/versions/
 

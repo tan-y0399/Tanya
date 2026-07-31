@@ -40,6 +40,112 @@
 - Alembic
 - DeepSeek Agent
 
+## Docker 一键部署（推荐）
+
+新电脑只需安装 [Docker Desktop](https://www.docker.com/products/docker-desktop/)，无需单独安装 Node.js / Python / PostgreSQL。
+
+### 快速启动
+
+**Linux / macOS**
+
+```bash
+git clone <repo-url> kylinops
+cd kylinops
+cp .env.docker.example .env.docker
+# 编辑 .env.docker，填入 LLM_API_KEY
+
+chmod +x scripts/docker-up.sh
+./scripts/docker-up.sh
+```
+
+**Windows PowerShell**
+
+```powershell
+git clone <repo-url> kylinops
+cd kylinops
+Copy-Item .env.docker.example .env.docker
+# 编辑 .env.docker，填入 LLM_API_KEY
+
+.\scripts\docker-up.ps1
+```
+
+启动后访问 `http://localhost:8000`，默认账号 `admin / admin123`。
+
+### Docker 架构
+
+默认启用 **Demo SSH 模式**（`--profile demo`），包含两个容器：
+
+| 容器 | 说明 |
+|------|------|
+| `kylinops-app` | 前后端一体（FastAPI + Vue 静态资源），端口 8000 |
+| `kylinops-target-vm` | Demo Linux SSH 目标机，供 Agent 执行运维命令 |
+
+数据（SQLite、上传文件、生成资源）持久化在 Docker Volume `kylinops-data` 中。
+
+### 常用命令
+
+```bash
+# 启动（Demo SSH 模式）
+docker compose --profile demo up -d --build
+
+# 查看状态
+docker compose ps
+
+# 查看日志
+docker compose logs -f app
+
+# 停止
+docker compose --profile demo down
+
+# 重置数据（重新初始化默认用户）
+docker compose --profile demo down -v
+docker compose --profile demo up -d --build
+```
+
+### 连接真实 SSH 目标机
+
+编辑 `.env.docker`，将 SSH 指向局域网内的麒麟 / Linux 主机，并挂载你的私钥：
+
+```yaml
+# docker-compose.yml 中 app.volumes 改为：
+# - C:/Users/你/.ssh/id_ed25519:/run/secrets/ssh_key:ro
+```
+
+```env
+SSH_HOST=192.168.x.x
+SSH_PORT=22
+SSH_USER=ty
+SSH_KEY_PATH=/run/secrets/ssh_key
+```
+
+然后不带 demo profile 启动：
+
+```bash
+docker compose up -d --build
+```
+
+### 可选：PostgreSQL
+
+```bash
+# .env.docker 中设置：
+# DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/yunwei
+
+docker compose --profile demo --profile postgres up -d --build
+```
+
+### 相关文件
+
+```
+docker-compose.yml
+.env.docker.example
+deploy/docker/Dockerfile
+deploy/docker/target-vm/
+scripts/docker-up.sh
+scripts/docker-up.ps1
+```
+
+---
+
 ## 启动前准备
 
 ### 前端环境

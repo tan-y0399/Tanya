@@ -1,0 +1,50 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+    container_name: kylinops-app
+    ports:
+      - "${KYLINOPS_PORT:-8000}:8000"
+    env_file:
+      - .env.docker
+    environment:
+      SSH_KEY_PATH: /run/secrets/ssh_key
+    volumes:
+      - kylinops-data:/app/backend/data
+      - ./deploy/docker/demo-keys/id_ed25519:/run/secrets/ssh_key:ro
+    depends_on:
+      target-vm:
+        condition: service_healthy
+        required: false
+    restart: unless-stopped
+
+  target-vm:
+    profiles: ["demo"]
+    build:
+      context: ./deploy/docker/target-vm
+    container_name: kylinops-target-vm
+    volumes:
+      - ./deploy/docker/demo-keys/id_ed25519.pub:/run/secrets/demo_pubkey:ro
+    restart: unless-stopped
+
+  postgres:
+    profiles: ["postgres"]
+    image: postgres:16-alpine
+    container_name: kylinops-postgres
+    environment:
+      POSTGRES_DB: yunwei
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d yunwei"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  kylinops-data:
+  pg-data:

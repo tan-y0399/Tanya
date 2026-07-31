@@ -37,6 +37,7 @@
         rows="1"
         :disabled="isStreaming"
         @keydown.enter.exact.prevent="send"
+        @paste="onPaste"
         @input="autoResize"
       ></textarea>
       <button v-if="isStreaming" class="stop-btn" @click="stop" title="停止生成">
@@ -58,6 +59,8 @@
     <div class="input-hint">
       <span>Enter 发送</span>
       <span class="hint-sep">·</span>
+      <span>Ctrl+V 粘贴文字或图片</span>
+      <span class="hint-sep">·</span>
       <span>支持文字与图片，深度思考将启用多模态专家链路</span>
     </div>
   </div>
@@ -66,8 +69,9 @@
 <script setup lang="ts">
 import { computed, ref, nextTick, onMounted } from 'vue'
 import type { ChatAttachment } from '@/stores/chat'
+import { collectClipboardImages, shouldSkipDuplicatePaste } from '@/utils/feedbackPaste'
 
-defineProps<{ isStreaming: boolean }>()
+const props = defineProps<{ isStreaming: boolean }>()
 const emit = defineEmits<{
   send: [text: string, attachments: ChatAttachment[]]
   stop: []
@@ -82,6 +86,8 @@ const canSend = computed(() => !!inputText.value.trim() || attachments.value.len
 
 const INPUT_MIN_HEIGHT = 24
 const INPUT_MAX_HEIGHT = 120
+const MAX_ATTACHMENTS = 4
+const MAX_IMAGE_SIZE = 8 * 1024 * 1024
 
 function autoResize() {
   nextTick(() => {
@@ -114,18 +120,19 @@ function removeAttachment(id?: string) {
   attachments.value = attachments.value.filter(a => a.id !== id)
 }
 
-function handleFiles(event: Event) {
-  const input = event.target as HTMLInputElement
-  const files = Array.from(input.files || [])
-  for (const file of files.slice(0, 4 - attachments.value.length)) {
+function addImageFiles(files: File[]) {
+  const remain = MAX_ATTACHMENTS - attachments.value.length
+  if (remain <= 0) return
+
+  for (const file of files.slice(0, remain)) {
     if (!file.type.startsWith('image/')) continue
-    if (file.size > 8 * 1024 * 1024) continue
+    if (file.size > MAX_IMAGE_SIZE) continue
     const reader = new FileReader()
     reader.onload = () => {
       attachments.value.push({
         id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
         kind: 'image',
-        name: file.name,
+        name: file.name || `paste-${Date.now()}.png`,
         contentType: file.type,
         size: file.size,
         dataUrl: String(reader.result || ''),
@@ -133,6 +140,50 @@ function handleFiles(event: Event) {
     }
     reader.readAsDataURL(file)
   }
+}
+
+function insertTextAtCursor(text: string) {
+  const el = inputRef.value
+  if (!el || !text) return
+  const start = el.selectionStart ?? inputText.value.length
+  const end = el.selectionEnd ?? inputText.value.length
+  const before = inputText.value.slice(0, start)
+  const after = inputText.value.slice(end)
+  inputText.value = before + text + after
+  nextTick(() => {
+    const pos = start + text.length
+    el.setSelectionRange(pos, pos)
+    el.focus()
+    autoResize()
+  })
+}
+
+function onPaste(event: ClipboardEvent) {
+  if (props.isStreaming) return
+  const data = event.clipboardData
+  if (!data) return
+
+  const imageFiles = collectClipboardImages(data)
+  if (!imageFiles.length) return
+
+  const sig = imageFiles.map(f => `${f.type}:${f.size}:${f.lastModified || 0}`).join('|')
+  if (shouldSkipDuplicatePaste(sig)) {
+    event.preventDefault()
+    return
+  }
+
+  event.preventDefault()
+  addImageFiles(imageFiles)
+
+  const plainText = data.getData('text/plain')
+  if (plainText) {
+    insertTextAtCursor(plainText)
+  }
+}
+
+function handleFiles(event: Event) {
+  const input = event.target as HTMLInputElement
+  addImageFiles(Array.from(input.files || []))
 }
 </script>
 
