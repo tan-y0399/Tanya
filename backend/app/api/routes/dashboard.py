@@ -21,7 +21,9 @@ router = APIRouter(prefix="/dashboard", tags=["仪表盘"])
 _executor = ThreadPoolExecutor(max_workers=8)
 
 # 单次 SSH 调用的超时秒数（Windows→VM NAT 场景下握手偏慢，过短会导致服务状态误判）
-SSH_CALL_TIMEOUT = 12
+SSH_CALL_TIMEOUT = 8
+# 仪表盘 overview 整批 SSH 采集上限（避免页面长时间无响应）
+DASHBOARD_SSH_TOTAL_TIMEOUT = 15
 
 # 内存缓存（仪表盘数据过期时间）
 _CACHE_TTL = 10  # 秒（实时趋势）
@@ -422,7 +424,7 @@ async def dashboard_overview(server_id: str = None, db: AsyncSession = Depends(g
         try:
             vm_metrics, services = await asyncio.wait_for(
                 loop.run_in_executor(_executor, _collect_all),
-                timeout=SSH_CALL_TIMEOUT * 3,
+                timeout=DASHBOARD_SSH_TOTAL_TIMEOUT,
             )
         except asyncio.TimeoutError:
             vm_metrics, services = {}, []

@@ -39,16 +39,23 @@ def _article_item(r: KnowledgeArticle, engagement: dict | None = None) -> dict:
 # 知识库文件路径（多级回退查找）
 def _resolve_kb_paths() -> dict:
     """查找所有知识库文件，返回 {来源名: 文件路径}"""
-    base_dir = r"C:\Users\33255\Desktop\新建文件夹"
+    repo_root = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    deploy_kb = os.path.join(repo_root, "deploy", "knowledge")
+    backend_root = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    legacy_base = r"C:\Users\33255\Desktop\新建文件夹"
     sources = {
         "kylin_ops": ["kylin_os_knowledge_base.md"],
         "common_faq": ["zhishiku.md"],
+        "linux_command_risk": ["linux_command_risk_knowledge.md"],
     }
     result = {}
     for src_name, filenames in sources.items():
         for fn in filenames:
             candidates = [
-                os.path.join(base_dir, fn),
+                os.path.join(deploy_kb, fn),
+                os.path.join(repo_root, fn),
+                os.path.join(backend_root, fn),
+                os.path.join(legacy_base, fn),
                 os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "新建文件夹", fn),
                 os.path.join(os.path.dirname(__file__), "..", "..", "..", fn),
             ]

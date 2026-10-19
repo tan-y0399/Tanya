@@ -14,7 +14,13 @@ import paramiko
 
 from app.core.config import settings
 from app.services.server_user_policy import assert_allowed_ssh_user
-from app.services.ssh_client import _load_private_key
+from app.services.ssh_client import (
+    _load_private_key,
+    ensure_platform_keypair,
+    ensure_public_key_file,
+    resolve_ssh_key_path,
+    resolve_ssh_public_key_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -165,19 +171,18 @@ def _connect_password(host: str, port: int, username: str, password: str, timeou
 
 
 def _read_platform_public_key() -> str:
-    key_path = os.path.expanduser(settings.ssh_key_path)
-    pub_path = key_path if key_path.endswith(".pub") else f"{key_path}.pub"
-    if not os.path.isfile(pub_path):
-        raise FileNotFoundError(f"平台 SSH 公钥不存在: {pub_path}")
+    # 平台公钥缺失时由私钥推导生成，避免新机器上直接失败
+    pub_path = ensure_public_key_file(settings.ssh_key_path)
     with open(pub_path, "r", encoding="utf-8") as f:
         return f.read().strip()
 
 
 def _verify_key_login(host: str, port: int, username: str, timeout: int = 15) -> tuple[bool, str]:
-    key_path = os.path.expanduser(settings.ssh_key_path)
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
+        # 密钥解析放在 try 内：平台上尚无密钥时应优雅返回 False，而不是抛异常导致 500
+        key_path = resolve_ssh_key_path(settings.ssh_key_path)
         key = _load_private_key(key_path)
         client.connect(
             hostname=host,
@@ -247,6 +252,37 @@ def auto_provision_server(
             _append_step(steps, tip, "warn")
         return {"success": False, "error": diag.get("message") or msg, "steps": steps, "diagnosis": diag}
 
+    # 确保平台密钥存在：新机器上此前没有密钥，需先生成，否则无法部署公钥
+    try:
+        try:
+            resolve_ssh_key_path(settings.ssh_key_path)
+            key_existed = True
+        except FileNotFoundError:
+            key_existed = False
+        platform_key = ensure_platform_keypair(settings.ssh_key_path)
+        if key_existed:
+            _append_step(steps, f"平台 SSH 密钥已就绪: {platform_key}", "ok")
+        else:
+            _append_step(steps, f"平台未配置 SSH 密钥，已自动生成 Ed25519 密钥对: {platform_key}", "ok")
+    except Exception as e:
+        err_msg = f"平台 SSH 密钥准备失败: {e}"
+        _append_step(steps, err_msg, "error")
+        return {"success": False, "error": err_msg, "steps": steps}
+
+    # 平台密钥已可登录时，无需密码（常见于已配置过免密 SSH 的服务器）
+    key_ok, key_msg = _verify_key_login(host, port, target_user, timeout=settings.ssh_timeout)
+    if key_ok:
+        _append_step(steps, "检测到平台 SSH 密钥已可免密登录，跳过密码部署", "ok")
+        _append_step(steps, key_msg, "ok")
+        _append_step(steps, "自动化配置完成，可安全保存服务器", "ok")
+        return {
+            "success": True,
+            "steps": steps,
+            "username": target_user,
+            "keyPath": resolve_ssh_key_path(settings.ssh_key_path),
+            "skippedPassword": True,
+        }
+
     client: Optional[paramiko.SSHClient] = None
     login_user: Optional[str] = None
     login_candidates = []
@@ -261,10 +297,26 @@ def auto_provision_server(
             _append_step(steps, f"SSH 密码登录成功（登录账户: {candidate}）", "ok")
             break
         except Exception as e:
-            _append_step(steps, f"尝试使用 {candidate} 登录失败", "warn")
+            detail = getattr(e, "args", [""])[0] if getattr(e, "args", None) else str(e)
+            _append_step(steps, f"尝试使用 {candidate} 登录失败（{detail or type(e).__name__}）", "warn")
 
     if not client or not login_user:
-        err = "无法使用提供的密码登录目标主机，请确认密码及 SSH 服务已开启"
+        key_ok2, key_msg2 = _verify_key_login(host, port, target_user, timeout=settings.ssh_timeout)
+        if key_ok2:
+            _append_step(steps, "密码不正确，但平台 SSH 密钥仍可登录，已改用密钥方式", "ok")
+            _append_step(steps, key_msg2, "ok")
+            _append_step(steps, "自动化配置完成，可安全保存服务器", "ok")
+            return {
+                "success": True,
+                "steps": steps,
+                "username": target_user,
+                "keyPath": resolve_ssh_key_path(settings.ssh_key_path),
+                "skippedPassword": True,
+            }
+        err = (
+            "无法使用提供的密码登录目标主机，请确认密码及 SSH 服务已开启。"
+            "若本机已配置 SSH 密钥，可清空「主机密码」后直接保存。"
+        )
         _append_step(steps, err, "error")
         return {"success": False, "error": err, "steps": steps}
 
@@ -297,7 +349,14 @@ usermod -aG wheel {target_user} 2>/dev/null || usermod -aG sudo {target_user} 2>
                 return {"success": False, "error": err_msg, "steps": steps}
             _append_step(steps, f"已创建用户 {target_user} 并加入特权组", "ok")
 
-        pubkey = _read_platform_public_key()
+        try:
+            pubkey = _read_platform_public_key()
+        except OSError as e:
+            # FileNotFoundError 与 PermissionError 均为 OSError 子类，
+            # 统一兜底，避免权限类问题逃逸成 500
+            err_msg = f"读取平台 SSH 公钥失败: {e}"
+            _append_step(steps, err_msg, "error")
+            return {"success": False, "error": err_msg, "steps": steps}
         pub_b64 = base64.b64encode(pubkey.encode("utf-8")).decode("ascii")
         deploy_script = f"""
 set -e
@@ -334,5 +393,5 @@ visudo -cf /etc/sudoers.d/kylinops-$TARGET >/dev/null 2>&1 || true
         "success": True,
         "steps": steps,
         "username": target_user,
-        "keyPath": settings.ssh_key_path,
+        "keyPath": resolve_ssh_key_path(settings.ssh_key_path),
     }

@@ -6,6 +6,7 @@ from sqlalchemy import select
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.tool_config import ToolConfig
+from app.services.builtin_tools import BUILTIN_TOOL_NAMES, ensure_builtin_tools, is_builtin_tool_name
 from app.services.tool_file_validator import validate_tool_file
 
 router = APIRouter(prefix="/tools", tags=["工具管理"])
@@ -28,6 +29,7 @@ def _serialize_tool(t: ToolConfig) -> dict:
         "category": t.category,
         "riskLevel": t.risk_level,
         "enabled": bool(t.enabled),
+        "builtin": is_builtin_tool_name(t.name),
         "config": cfg,
         "createdAt": t.created_at.isoformat() if t.created_at else "",
         "updatedAt": t.updated_at.isoformat() if t.updated_at else "",
@@ -39,6 +41,7 @@ async def list_tools(
     user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await ensure_builtin_tools(db)
     result = await db.execute(select(ToolConfig).order_by(ToolConfig.category, ToolConfig.name))
     tools = result.scalars().all()
     return {"code": 0, "data": {"items": [_serialize_tool(t) for t in tools]}}
@@ -185,6 +188,8 @@ async def delete_tool(
     tool = (await db.execute(select(ToolConfig).where(ToolConfig.id == tool_id))).scalar_one_or_none()
     if not tool:
         raise HTTPException(status_code=404, detail="工具不存在")
+    if is_builtin_tool_name(tool.name):
+        raise HTTPException(status_code=400, detail="内置工具不可删除，可改用禁用开关")
 
     await db.delete(tool)
     await db.commit()

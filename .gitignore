@@ -43,6 +43,8 @@ id_rsa*
 id_ed25519*
 
 # IDE
+.claude/
+.workbuddy-ai/
 .idea/
 .vscode/
 *.swp

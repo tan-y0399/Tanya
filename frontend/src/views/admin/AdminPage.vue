@@ -93,9 +93,10 @@
         </div>
         <div class="data-card">
           <el-table :data="filteredTools" stripe empty-text="暂无匹配工具">
-            <el-table-column label="工具名称" width="200">
+            <el-table-column label="工具名称" width="220">
               <template #default="{ row }">
                 <code class="tool-name">{{ row.name }}</code>
+                <span v-if="row.builtin" class="builtin-tag">内置</span>
               </template>
             </el-table-column>
             <el-table-column prop="description" label="功能描述" min-width="200" show-overflow-tooltip />
@@ -118,11 +119,11 @@
               <template #default="{ row }">
                 <el-dropdown trigger="click" @command="(cmd: string) => handleToolAction(cmd, row)">
                   <button type="button" class="more-btn" @click.stop><el-icon><MoreFilled /></el-icon></button>
-                  <template #dropdown>
+                    <template #dropdown>
                     <el-dropdown-menu>
-                      <el-dropdown-item command="edit">编辑工具</el-dropdown-item>
+                      <el-dropdown-item command="edit" :disabled="row.builtin">编辑工具</el-dropdown-item>
                       <el-dropdown-item command="toggle">{{ row.enabled ? '禁用' : '启用' }}</el-dropdown-item>
-                      <el-dropdown-item command="delete" divided><span class="danger-text">删除</span></el-dropdown-item>
+                      <el-dropdown-item v-if="!row.builtin" command="delete" divided><span class="danger-text">删除</span></el-dropdown-item>
                     </el-dropdown-menu>
                   </template>
                 </el-dropdown>
@@ -630,6 +631,7 @@ const PRESET_TOOLS = [
   { name: 'get_process_detail', description: '获取指定进程的详细信息', category: 'process_management', riskLevel: 1 },
   { name: 'kill_process', description: '终止指定进程，默认发送TERM信号', category: 'process_management', riskLevel: 3 },
   { name: 'get_network_connections', description: '查询网络连接状态和监听端口', category: 'network_management', riskLevel: 1 },
+  { name: 'get_network_speed', description: '采样计算网卡实时收发速率（KB/s、Mbps），并给出网速好坏评价', category: 'network_management', riskLevel: 1 },
   { name: 'get_service_status', description: '获取指定系统服务的状态', category: 'service_management', riskLevel: 1 },
   { name: 'manage_service', description: '管理系统服务：启动、停止、重启、重载', category: 'service_management', riskLevel: 3 },
   { name: 'get_file_list', description: '获取指定目录的文件列表', category: 'file_management', riskLevel: 1 },
@@ -849,9 +851,15 @@ async function handleDeleteUser(row: UserInfo) {
 }
 
 function handleToolAction(cmd: string, row: ToolInfo) {
-  if (cmd === 'edit') openEditTool(row)
+  if (cmd === 'edit') {
+    if (row.builtin) { ElMessage.info('内置工具不可编辑，可使用启用开关控制'); return }
+    openEditTool(row)
+  }
   else if (cmd === 'toggle') onToggleTool(!row.enabled, row)
-  else if (cmd === 'delete') handleDeleteTool(row)
+  else if (cmd === 'delete') {
+    if (row.builtin) { ElMessage.warning('内置工具不可删除，可改用禁用开关'); return }
+    handleDeleteTool(row)
+  }
 }
 
 function openAddToolDialog() {

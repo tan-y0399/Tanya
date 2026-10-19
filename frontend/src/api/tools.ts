@@ -7,6 +7,7 @@ export interface ToolInfo {
   category: string
   riskLevel: number
   enabled: boolean
+  builtin?: boolean
   config: Record<string, any>
   createdAt: string
   updatedAt: string

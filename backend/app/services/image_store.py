@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import imghdr
 import os
 import re
 import uuid
@@ -26,6 +25,31 @@ ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 def chat_upload_dir() -> Path:
     UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     return UPLOAD_ROOT
+
+
+def _detect_image_type(raw: bytes) -> Optional[str]:
+    """基于文件头魔数识别图片类型。
+
+    替代 Python 3.13 起被移除的标准库 ``imghdr``，返回值与 imghdr 保持一致：
+    png / jpeg / webp / gif（jpeg 由调用方转换为 jpg）。
+    """
+    if not raw:
+        return None
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if raw.startswith(b"GIF87a") or raw.startswith(b"GIF89a"):
+        return "gif"
+    if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "webp"
+    if raw.startswith(b"BM"):
+        return "bmp"
+    if len(raw) >= 12 and raw[:4] == b"\x00\x00\x01\x00":
+        return "ico"
+    if raw.startswith(b"II*\x00") or raw.startswith(b"MM\x00*"):
+        return "tiff"
+    return None
 
 
 def _safe_filename(name: str) -> str:
@@ -55,7 +79,7 @@ def _decode_data_url(data_url: str) -> tuple[str, bytes]:
         raise ValueError("图片 base64 内容无效") from exc
     if len(raw) > MAX_IMAGE_BYTES:
         raise ValueError("单张图片不能超过 8MB")
-    detected = imghdr.what(None, raw)
+    detected = _detect_image_type(raw)
     if detected == "jpeg":
         detected = "jpg"
     if detected and detected not in {"png", "jpg", "webp", "gif"}:

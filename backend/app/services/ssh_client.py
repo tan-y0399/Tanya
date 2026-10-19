@@ -46,6 +46,115 @@ from app.services.server_user_policy import assert_allowed_ssh_user
 MAX_RETRIES = 2
 
 
+def resolve_ssh_key_path(key_path: Optional[str] = None) -> str:
+    """解析私钥路径；不存在时回退 id_ed25519 / id_rsa 等常见密钥。"""
+    candidates = []
+    configured = key_path or _settings.ssh_key_path
+    if configured:
+        candidates.append(os.path.expanduser(configured))
+    home_ssh = os.path.join(os.path.expanduser("~"), ".ssh")
+    for name in ("id_ed25519", "id_rsa", "id_ecdsa"):
+        candidates.append(os.path.join(home_ssh, name))
+    seen = set()
+    for path in candidates:
+        norm = os.path.normpath(path)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        if os.path.isfile(norm):
+            return norm
+    raise FileNotFoundError(
+        f"未找到可用私钥（已尝试: {', '.join(seen)}）。"
+        "请生成密钥或先在服务器管理中用密码完成 AUTO SSH PROVISION。"
+    )
+
+
+def resolve_ssh_public_key_path(key_path: Optional[str] = None) -> str:
+    priv = resolve_ssh_key_path(key_path)
+    pub = priv if priv.endswith(".pub") else f"{priv}.pub"
+    if os.path.isfile(pub):
+        return pub
+    raise FileNotFoundError(f"平台 SSH 公钥不存在: {pub}")
+
+
+def _default_key_target(key_path: Optional[str] = None) -> str:
+    """确定平台密钥的落盘路径（优先使用配置路径，否则用 ~/.ssh/kylinops_ed25519）。"""
+    configured = key_path or _settings.ssh_key_path
+    if configured:
+        expanded = os.path.expanduser(configured)
+        # 配置了 .pub 时落到同名私钥
+        if expanded.endswith(".pub"):
+            expanded = expanded[:-4]
+        return os.path.normpath(expanded)
+    home_ssh = os.path.join(os.path.expanduser("~"), ".ssh")
+    return os.path.normpath(os.path.join(home_ssh, "kylinops_ed25519"))
+
+
+def ensure_platform_keypair(key_path: Optional[str] = None) -> str:
+    """确保平台 SSH 密钥对存在；不存在时自动生成 Ed25519 密钥对。
+
+    返回可用的私钥路径。生成的公钥写入 ``<私钥>.pub``，
+    以便 AUTO SSH PROVISION 将公钥部署到目标主机实现免密登录。
+
+    注意：旧版本假设平台上已有密钥，新机器上没有密钥时
+    ``resolve_ssh_key_path`` 会抛 FileNotFoundError 导致接口 500；
+    此函数用于补齐这一缺失环节。
+    """
+    try:
+        return resolve_ssh_key_path(key_path)
+    except FileNotFoundError:
+        pass
+
+    from cryptography.hazmat.primitives import serialization as _ser
+    from cryptography.hazmat.primitives.asymmetric import ed25519 as _ed25519
+
+    priv_path = _default_key_target(key_path)
+    pub_path = f"{priv_path}.pub"
+    key_dir = os.path.dirname(priv_path) or "."
+    os.makedirs(key_dir, exist_ok=True)
+    try:
+        os.chmod(key_dir, 0o700)
+    except OSError:
+        pass
+
+    key = _ed25519.Ed25519PrivateKey.generate()
+    priv_pem = key.private_bytes(
+        encoding=_ser.Encoding.PEM,
+        format=_ser.PrivateFormat.OpenSSH,
+        encryption_algorithm=_ser.NoEncryption(),
+    )
+    pub_line = key.public_key().public_bytes(
+        encoding=_ser.Encoding.OpenSSH,
+        format=_ser.PublicFormat.OpenSSH,
+    ).decode("ascii")
+
+    # 先写私钥并收紧权限，再写公钥
+    with open(priv_path, "wb") as f:
+        f.write(priv_pem)
+    try:
+        os.chmod(priv_path, 0o600)
+    except OSError:
+        pass
+    with open(pub_path, "w", encoding="utf-8") as f:
+        f.write(f"{pub_line} kylinops\n")
+
+    logger.info(f"已自动生成平台 SSH 密钥对: {priv_path}")
+    return priv_path
+
+
+def ensure_public_key_file(key_path: Optional[str] = None) -> str:
+    """确保公钥文件存在；缺失时由私钥推导并写入 ``<私钥>.pub``。"""
+    priv = ensure_platform_keypair(key_path)
+    pub = f"{priv}.pub"
+    if os.path.isfile(pub):
+        return pub
+    key = _load_private_key(priv)
+    line = f"{key.get_name()} {key.get_base64()} kylinops\n"
+    with open(pub, "w", encoding="utf-8") as f:
+        f.write(line)
+    return pub
+
+
 class SSHClient:
     """SSH 连接管理器，封装与远程麒麟VM的通信。"""
 
@@ -73,24 +182,7 @@ class SSHClient:
 
     def _resolve_key_path(self) -> str:
         """解析私钥路径；配置的文件不存在时回退到常见密钥名（Windows 常只有 id_ed25519）。"""
-        candidates = []
-        if self.key_path:
-            candidates.append(os.path.expanduser(self.key_path))
-        home_ssh = os.path.join(os.path.expanduser("~"), ".ssh")
-        for name in ("id_ed25519", "id_rsa", "id_ecdsa"):
-            candidates.append(os.path.join(home_ssh, name))
-        seen = set()
-        for path in candidates:
-            norm = os.path.normpath(path)
-            if norm in seen:
-                continue
-            seen.add(norm)
-            if os.path.isfile(norm):
-                return norm
-        raise FileNotFoundError(
-            f"未找到可用私钥（已尝试: {', '.join(seen)}）。"
-            "请生成密钥或先在服务器管理中用密码完成 AUTO SSH PROVISION。"
-        )
+        return resolve_ssh_key_path(self.key_path)
 
     def connect(self) -> None:
         """建立 SSH 连接，启用 keepalive 防止空闲断开。"""

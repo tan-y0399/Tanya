@@ -116,6 +116,14 @@ async def startup():
         # 每次启动都执行：确保知识库和服务器数据完整
         await seed_knowledge(db)
 
+        try:
+            from app.services.builtin_tools import ensure_builtin_tools
+            added = await ensure_builtin_tools(db)
+            if added:
+                logger.info("Registered %d built-in tools", added)
+        except Exception as e:
+            logger.warning("builtin tools seed: %s", e)
+
         knowledge_count = (await db.execute(
             select(func.count()).select_from(KnowledgeArticle)
         )).scalar() or 0

@@ -1,5 +1,8 @@
 import os
 import time
+import asyncio
+import logging
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import APIRouter, Depends, Body, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -9,10 +12,43 @@ from app.core.security import get_current_user
 from app.models.server import Server
 
 router = APIRouter(prefix="/system", tags=["系统"])
+logger = logging.getLogger(__name__)
 
 # 定位 .env 文件：优先从环境变量读取，否则在 backend 目录下找
 _ENV_PATH = os.environ.get("KILINOPS_ENV_PATH", os.path.join(os.path.dirname(__file__), "..", "..", "..", ".env"))
 _ENV_PATH = os.path.abspath(_ENV_PATH)
+
+_health_executor = ThreadPoolExecutor(max_workers=2)
+_HEALTH_SSH_TIMEOUT = 8.0
+
+
+def _probe_vm_agent(default_server) -> tuple[str, int | None, str, int, str]:
+    """同步探测 VM SSH（在线程池中执行，避免阻塞事件循环）。"""
+    from app.services.ssh_client import SSHClient, SSH_POOL
+
+    vm_host = settings.ssh_host
+    vm_port = settings.ssh_port
+    vm_username = settings.ssh_user
+    t0 = time.time()
+    if default_server:
+        ssh = SSH_POOL.get_or_create(
+            default_server.id,
+            default_server.host,
+            default_server.port,
+            default_server.username,
+            default_server.key_path,
+        )
+    else:
+        ssh = SSHClient()
+        ssh.connect()
+
+    if ssh.is_alive():
+        vm_status = "up"
+    else:
+        ssh.reconnect()
+        vm_status = "up" if ssh.is_alive() else "down"
+    vm_latency = round((time.time() - t0) * 1000)
+    return vm_status, vm_latency, ssh.host, ssh.port, ssh.username
 
 
 @router.get("/health")
@@ -33,31 +69,14 @@ async def health(db: AsyncSession = Depends(get_db)):
         vm_server_name = default_server.name
 
     try:
-        from app.services.ssh_client import SSHClient, SSH_POOL
-
-        t0 = time.time()
-        if default_server:
-            ssh = SSH_POOL.get_or_create(
-                default_server.id,
-                default_server.host,
-                default_server.port,
-                default_server.username,
-                default_server.key_path,
-            )
-        else:
-            ssh = SSHClient()
-            ssh.connect()
-
-        if ssh.is_alive():
-            vm_status = "up"
-        else:
-            ssh.reconnect()
-            vm_status = "up" if ssh.is_alive() else "down"
-        vm_latency = round((time.time() - t0) * 1000)
-
-        vm_host = ssh.host
-        vm_port = ssh.port
-        vm_username = ssh.username
+        loop = asyncio.get_running_loop()
+        vm_status, vm_latency, vm_host, vm_port, vm_username = await asyncio.wait_for(
+            loop.run_in_executor(_health_executor, _probe_vm_agent, default_server),
+            timeout=_HEALTH_SSH_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        vm_status = "down"
+        logger.warning("VM agent health probe timed out after %.0fs", _HEALTH_SSH_TIMEOUT)
     except Exception:
         vm_status = "down"
 

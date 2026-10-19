@@ -146,6 +146,39 @@ scripts/docker-up.ps1
 
 ---
 
+### 导入 deploy 预置数据（SQL + 知识库）
+
+将 `deploy/sql` 与 `deploy/knowledge` 写入当前数据库（工具、知识库、演示账号、默认服务器）：
+
+**Windows PowerShell**
+
+```powershell
+.\deploy\import-all.ps1
+```
+
+**Linux / macOS**
+
+```bash
+chmod +x deploy/import-all.sh
+./deploy/import-all.sh
+```
+
+或手动：
+
+```bash
+cd backend
+python scripts/import_deploy_data.py
+```
+
+导入内容：
+- `deploy/sql/tool_configs.sqlite.sql` — 8 个自定义工具
+- `deploy/sql/knowledge_articles.sql` — 银河麒麟运维知识库（约 100+ 篇）
+- `deploy/knowledge/linux_command_risk_knowledge.md` — Linux 命令风险分级
+- `deploy/sql/users.sql` — 演示账号 admin / ty
+- `deploy/sql/servers.sql` — 默认 SSH 服务器（host 对齐 `.env`）
+
+---
+
 ## 启动前准备
 
 ### 前端环境
